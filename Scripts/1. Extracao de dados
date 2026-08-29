@@ -24,7 +24,7 @@ library(tidyr)
 library(lubridate)
 
 INICIO <- as.Date("1981-01-01")
-FIM    <- as.Date("2025-02-28")
+FIM    <- as.Date("2025-12-31")
 
 # máximo de dias faltantes tolerados num bloco mensal
 MAX_FALHAS <- 3
@@ -263,7 +263,7 @@ cobertura <- max_all %>%
     by = "fonte"
   ) %>%
   mutate(
-    meses_no_intervalo = 530,   # jan/1981 a fev/2025
+    meses_no_intervalo = length(seq(INICIO, FIM, by = "month")),   # jan/1981 a fev/2025
     cobertura_pct = round(100 * blocos_validos / meses_no_intervalo, 1)
   )
 
