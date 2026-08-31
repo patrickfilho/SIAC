@@ -1,0 +1,267 @@
+# ============================================================
+# Extração BR-DWGD e ANA  -  Taquari / RS
+# Script independente. Não junta com CHIRPS/NASA POWER ainda.
+# Grava em <SIAC>/diario/ no schema padrão: data | prec
+# ============================================================
+#
+# Correções incorporadas:
+#   - brclimr: a função é fetch_data(), não zonal_data()
+#   - hydrobr: não está no CRAN; a função é inventory()
+#   - CRS: inv vem em EPSG:4326 e centro em EPSG:4674 -> haversine
+#   - inventário do hydrobr não traz período de operação:
+#     é preciso baixar vários postos e medir a cobertura
+#   - série da ANA precisa de grade completa de dias para que
+#     os buracos apareçam como NA
+#
+# Instale uma vez, depois comente estas linhas:
+# install.packages(c("brclimr", "remotes", "sf", "dplyr", "lubridate", "geobr"))
+# remotes::install_github("hydroversebr/hydrobr")
+# ============================================================
+
+library(sf)
+library(dplyr)
+library(lubridate)
+
+INICIO   <- as.Date("1981-01-01")
+FIM      <- as.Date("2025-12-31")
+COD_IBGE <- 4321303          # Taquari/RS  (Taquara é 4321204, não confundir)
+
+DESTINO <- "C:/Users/Patrick Filho/OneDrive/Área de Trabalho/LabMA/SIAC"
+
+dir.create(file.path(DESTINO, "diario"), showWarnings = FALSE, recursive = TRUE)
+if (!dir.exists(DESTINO))
+  stop("Caminho nao encontrado. Verifique o acento em 'Area de Trabalho'.")
+
+
+# ------------------------------------------------------------
+# 0. Centroide de Taquari
+# ------------------------------------------------------------
+
+library(geobr)
+
+mun_rs  <- read_municipality(code_muni = "RS", year = 2020)
+taquari <- mun_rs %>% filter(code_muni == COD_IBGE)
+stopifnot(nrow(taquari) == 1)
+
+centro <- suppressWarnings(st_centroid(taquari))
+xy     <- st_coordinates(centro)
+LON    <- xy[1, "X"]
+LAT    <- xy[1, "Y"]
+
+cat(sprintf("Taquari/RS | lon %.5f | lat %.5f\n\n", LON, LAT))
+
+
+# ------------------------------------------------------------
+# Função de gravação no schema padrão
+# ------------------------------------------------------------
+
+gravar_diario <- function(df, fonte) {
+  out <- df %>%
+    filter(data >= INICIO, data <= FIM) %>%
+    transmute(data = as.Date(data), prec = as.numeric(prec)) %>%
+    mutate(prec = ifelse(prec < 0, NA_real_, prec)) %>%
+    distinct(data, .keep_all = TRUE) %>%
+    arrange(data)
+
+  write.csv(out, file.path(DESTINO, "diario", paste0(fonte, ".csv")),
+            row.names = FALSE)
+
+  cat(sprintf("\n%-10s %5d dias | %s a %s | %d faltantes\n",
+              fonte, nrow(out), min(out$data), max(out$data),
+              sum(is.na(out$prec))))
+  invisible(out)
+}
+
+
+# ############################################################
+# PARTE A - BR-DWGD via brclimr
+# ############################################################
+
+library(brclimr)
+
+# indicadores e estatísticas disponíveis
+product_info("brdwgd")
+
+# "pr" = precipitação
+# "mean" = média das células que intersectam o município.
+#   É o mais próximo do CHIRPS, que é célula única no centroide.
+brdwgd_dia <- fetch_data(
+  code_muni  = COD_IBGE,
+  product    = "brdwgd",
+  indicator  = "pr",
+  statistics = "mean",
+  date_start = INICIO,
+  date_end   = FIM
+) %>%
+  transmute(data = as.Date(date), prec = value)
+
+cat("\nBR-DWGD bruto:", nrow(brdwgd_dia), "linhas |",
+    as.character(min(brdwgd_dia$data)), "a",
+    as.character(max(brdwgd_dia$data)), "\n")
+
+gravar_diario(brdwgd_dia, "BR_DWGD")
+
+# >>> OLHE A DATA FINAL ACIMA <<<
+# A metodologia do brclimr descreve a grade indo até 2020-07-31.
+# Se for esse o caso, a série é mais curta que as outras fontes.
+# Isso é aceitável: 1981-2020 dá ~474 blocos mensais.
+# A alternativa (NetCDF do Xavier) exige ~6 GB de RAM e ambiente
+# Python com miniconda, o que não compensa para um município.
+# Fonte: https://github.com/AlexandreCandidoXavier/BR-DWGD
+
+
+# ############################################################
+# PARTE B - ANA / HidroWeb via hydrobr
+# ############################################################
+
+library(hydrobr)
+
+
+# ---- B1. Inventário de postos pluviométricos no RS ----
+
+inv <- inventory(
+  states      = "RIO GRANDE DO SUL",
+  stationType = "plu",
+  as_sf       = TRUE,
+  aoi         = NULL
+)
+
+cat("\nPostos pluviometricos no RS:", nrow(inv), "\n")
+cat("Colunas:", paste(names(inv), collapse = ", "), "\n")
+
+
+# ---- B2. Postos próximos (haversine, evita conflito de CRS) ----
+
+haversine <- function(lat1, lon1, lat2, lon2) {
+  R <- 6371
+  dlat <- (lat2 - lat1) * pi/180
+  dlon <- (lon2 - lon1) * pi/180
+  a <- sin(dlat/2)^2 + cos(lat1*pi/180) * cos(lat2*pi/180) * sin(dlon/2)^2
+  2 * R * asin(sqrt(a))
+}
+
+inv_perto <- as.data.frame(inv) %>%
+  mutate(dist_km = round(haversine(lat, long, LAT, LON), 1)) %>%
+  filter(dist_km <= 50) %>%
+  arrange(dist_km) %>%
+  select(station_code, name, lat, long, dist_km)
+
+cat("\n--- Postos ate 50 km do centroide ---\n")
+print(head(inv_perto, 25))
+cat("Total:", nrow(inv_perto), "postos\n")
+
+write.csv(inv_perto, file.path(DESTINO, "ana_postos_proximos.csv"),
+          row.names = FALSE)
+
+
+# ---- B3. Baixar candidatos ----
+# O inventário não traz período de operação nem falhas, então
+# é preciso baixar para descobrir. Comece pelos mais próximos.
+
+N_CANDIDATOS <- 6
+candidatos   <- head(inv_perto$station_code, N_CANDIDATOS)
+
+cat("\nBaixando:", paste(candidatos, collapse = ", "), "\n")
+
+dados_brutos <- stationsData(
+  inventoryResult  = inv %>% filter(station_code %in% candidatos),
+  deleteNAstations = FALSE
+)
+
+organizados <- organize(dados_brutos)
+
+# diagnóstico: os nomes de coluna variam entre versões
+cat("\nEstrutura do retorno:\n")
+print(names(organizados))
+str(organizados[[1]], max.level = 1)
+print(head(organizados[[1]], 3))
+
+
+# ---- B4. Avaliar cobertura de cada candidato ----
+
+pega_col <- function(df, opcoes) intersect(opcoes, names(df))[1]
+
+padroniza <- function(df) {
+  cd <- pega_col(df, c("date", "data", "Data"))
+  cp <- pega_col(df, c("value", "prec", "precipitation", "Total", "chuva"))
+  if (is.na(cd) || is.na(cp)) return(NULL)
+  df %>% transmute(data = as.Date(.data[[cd]]),
+                   prec = as.numeric(.data[[cp]]))
+}
+
+dias_periodo <- as.numeric(FIM - INICIO) + 1
+
+avaliar <- function(df, codigo) {
+  s <- padroniza(df)
+  if (is.null(s)) { warning("colunas nao identificadas: ", codigo); return(NULL) }
+  s <- s %>% filter(data >= INICIO, data <= FIM)
+  if (nrow(s) == 0) return(NULL)
+
+  data.frame(
+    station_code  = as.character(codigo),
+    inicio        = as.character(min(s$data)),
+    fim           = as.character(max(s$data)),
+    n_registros   = nrow(s),
+    n_com_dado    = sum(!is.na(s$prec)),
+    pct_cobertura = round(100 * sum(!is.na(s$prec)) / dias_periodo, 1),
+    max_prec      = round(suppressWarnings(max(s$prec, na.rm = TRUE)), 1)
+  )
+}
+
+resumo <- bind_rows(
+  lapply(seq_along(organizados), function(i)
+    avaliar(organizados[[i]], names(organizados)[i]))
+) %>%
+  left_join(inv_perto %>% mutate(station_code = as.character(station_code)),
+            by = "station_code") %>%
+  arrange(desc(pct_cobertura))
+
+cat("\n=========== COBERTURA DOS CANDIDATOS ===========\n")
+print(resumo)
+
+write.csv(resumo, file.path(DESTINO, "ana_candidatos.csv"), row.names = FALSE)
+
+
+# ---- B5. Escolher o posto e gravar ----
+# Critério, nesta ordem: cobertura temporal, taxa de falhas,
+# proximidade só como desempate. Um posto a 40 km com série
+# completa vale mais que um a 5 km que operou dez anos.
+
+CODIGO_ANA <- NA    # <-- preencha olhando a tabela acima
+
+if (!is.na(CODIGO_ANA)) {
+
+  ana_dia <- padroniza(organizados[[as.character(CODIGO_ANA)]]) %>%
+    arrange(data)
+
+  # grade completa de dias: sem isso o buraco não vira NA e a
+  # regra de falhas do bloco mensal não enxerga a ausência
+  grade   <- data.frame(data = seq(INICIO, FIM, by = "day"))
+  ana_dia <- left_join(grade, ana_dia, by = "data")
+
+  gravar_diario(ana_dia, "ANA")
+
+  cat("\n--- Falhas por ano ---\n")
+  falhas_ano <- ana_dia %>%
+    mutate(ano = year(data)) %>%
+    group_by(ano) %>%
+    summarise(dias = n(), faltantes = sum(is.na(prec)),
+              pct_falha = round(100 * faltantes / dias, 1),
+              .groups = "drop") %>%
+    as.data.frame()
+
+  print(falhas_ano)
+  write.csv(falhas_ano, file.path(DESTINO, "ana_falhas_por_ano.csv"),
+            row.names = FALSE)
+
+} else {
+  message("\n>> Preencha CODIGO_ANA olhando ana_candidatos.csv e rode B5.")
+}
+
+
+# ------------------------------------------------------------
+# Confirmação
+# ------------------------------------------------------------
+
+cat("\n=== Arquivos em", DESTINO, "===\n")
+print(list.files(DESTINO, recursive = TRUE))
