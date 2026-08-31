@@ -179,15 +179,26 @@ print(head(organizados[[1]], 3))
 
 # ---- B4. Avaliar cobertura de cada candidato ----
 
+# --- diagnóstico: quantos sobreviveram em cada etapa ---
+cat("stationsData:", length(dados_brutos), "postos ->",
+    paste(names(dados_brutos), collapse = ", "), "\n")
+cat("organize    :", length(organizados), "postos ->",
+    paste(names(organizados), collapse = ", "), "\n")
+
+# --- padronizador corrigido ---
 pega_col <- function(df, opcoes) intersect(opcoes, names(df))[1]
 
 padroniza <- function(df) {
   cd <- pega_col(df, c("date", "data", "Data"))
-  cp <- pega_col(df, c("value", "prec", "precipitation", "Total", "chuva"))
+  cp <- pega_col(df, c("rainfall_mm", "value", "prec", "Total", "chuva"))
   if (is.na(cd) || is.na(cp)) return(NULL)
   df %>% transmute(data = as.Date(.data[[cd]]),
                    prec = as.numeric(.data[[cp]]))
 }
+
+# usa os 6 brutos, não a lista reduzida pelo organize()
+fonte_lista <- if (length(organizados) >= length(dados_brutos))
+                 organizados else dados_brutos
 
 dias_periodo <- as.numeric(FIM - INICIO) + 1
 
@@ -195,8 +206,10 @@ avaliar <- function(df, codigo) {
   s <- padroniza(df)
   if (is.null(s)) { warning("colunas nao identificadas: ", codigo); return(NULL) }
   s <- s %>% filter(data >= INICIO, data <= FIM)
-  if (nrow(s) == 0) return(NULL)
-
+  if (nrow(s) == 0)
+    return(data.frame(station_code = as.character(codigo), inicio = NA,
+                      fim = NA, n_registros = 0L, n_com_dado = 0L,
+                      pct_cobertura = 0, max_prec = NA_real_))
   data.frame(
     station_code  = as.character(codigo),
     inicio        = as.character(min(s$data)),
@@ -209,18 +222,19 @@ avaliar <- function(df, codigo) {
 }
 
 resumo <- bind_rows(
-  lapply(seq_along(organizados), function(i)
-    avaliar(organizados[[i]], names(organizados)[i]))
-) %>%
-  left_join(inv_perto %>% mutate(station_code = as.character(station_code)),
-            by = "station_code") %>%
-  arrange(desc(pct_cobertura))
+  lapply(seq_along(fonte_lista), function(i)
+    avaliar(fonte_lista[[i]], names(fonte_lista)[i]))
+)
 
-cat("\n=========== COBERTURA DOS CANDIDATOS ===========\n")
+if (nrow(resumo) > 0) {
+  resumo <- resumo %>%
+    left_join(inv_perto %>% mutate(station_code = as.character(station_code)),
+              by = "station_code") %>%
+    arrange(desc(pct_cobertura))
+}
+
 print(resumo)
-
 write.csv(resumo, file.path(DESTINO, "ana_candidatos.csv"), row.names = FALSE)
-
 
 # ---- B5. Escolher o posto e gravar ----
 # Critério, nesta ordem: cobertura temporal, taxa de falhas,
