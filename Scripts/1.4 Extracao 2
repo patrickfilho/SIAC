@@ -154,104 +154,207 @@ write.csv(inv_perto, file.path(DESTINO, "ana_postos_proximos.csv"),
           row.names = FALSE)
 
 
-# ---- B3/B4. Baixar candidatos posto a posto e avaliar cobertura ----
-# O organize() em lote descartou 5 de 6 postos. Rodando um a um
-# para descobrir se era limitacao do processamento em lote.
+# ============================================================
+# B3 + B4  -  Diagnóstico dos postos da ANA próximos de Taquari
+# Substitui integralmente os blocos B3 e B4 anteriores.
+# ============================================================
+#
+# Por que não usamos organize():
+#   o organize() do hydrobr rejeitou 5 dos 6 postos por critério
+#   interno, e o único aprovado não tem nenhum registro dentro de
+#   1981-2025. Pivotamos os dados brutos diretamente.
+#
+# Formato bruto da ANA: uma linha por MÊS, com colunas chuva01..chuva31.
+# Precisamos de uma linha por DIA para bater com as outras fontes.
+# ============================================================
+
+library(tidyr)
 
 N_CANDIDATOS <- 6
 candidatos   <- head(inv_perto$station_code, N_CANDIDATOS)
 
-organizados <- list()
+
+# ------------------------------------------------------------
+# Pivot: matriz mensal -> série diária
+# ------------------------------------------------------------
+
+pivotar_ana <- function(bruto_df) {
+  df <- as.data.frame(bruto_df)
+  names(df) <- sub("^X[0-9]+\\.", "", names(df))   # remove prefixo do código
+
+  cols_chuva <- grep("^chuva[0-9]{2}$", names(df), value = TRUE)
+  if (length(cols_chuva) == 0 || !"data" %in% names(df)) return(NULL)
+
+  tem_nivel <- "nivelconsistencia" %in% names(df)
+  if (!tem_nivel) df$nivelconsistencia <- 1
+
+  df %>%
+    select(nivelconsistencia, data, all_of(cols_chuva)) %>%
+    pivot_longer(all_of(cols_chuva), names_to = "dia", values_to = "prec") %>%
+    mutate(
+      dia      = as.integer(sub("chuva", "", dia)),
+      mes_ini  = as.Date(data),
+      data_dia = mes_ini + (dia - 1)
+    ) %>%
+    filter(!is.na(data_dia), month(data_dia) == month(mes_ini)) %>%
+    # nivel 2 = consistido; preferir sobre o bruto (1) quando houver os dois
+    arrange(data_dia, desc(nivelconsistencia)) %>%
+    distinct(data_dia, .keep_all = TRUE) %>%
+    transmute(data = data_dia, prec = as.numeric(prec)) %>%
+    arrange(data)
+}
+
+
+# ------------------------------------------------------------
+# Baixar e pivotar os candidatos
+# ------------------------------------------------------------
+
+series <- list()
 
 for (cod in candidatos) {
-  message("--- ", cod)
-  bruto <- stationsData(inventoryResult = inv %>% filter(station_code == cod),
-                        deleteNAstations = FALSE)
-  org <- try(organize(bruto), silent = TRUE)
+  message("--- baixando ", cod)
+  b <- try(stationsData(inventoryResult = inv %>% filter(station_code == cod),
+                        deleteNAstations = FALSE), silent = TRUE)
+  if (inherits(b, "try-error")) { message("  falha no download"); next }
 
-  if (!inherits(org, "try-error") && length(org) > 0) {
-    organizados[[as.character(cod)]] <- org[[1]]
-    message("  ok: ", nrow(org[[1]]), " linhas")
-  } else {
-    message("  descartado pelo organize()")
+  p <- try(pivotar_ana(b[[1]]), silent = TRUE)
+  if (inherits(p, "try-error") || is.null(p) || nrow(p) == 0) {
+    message("  falha no pivot"); next
   }
+
+  series[[as.character(cod)]] <- p
+  message(sprintf("  %d dias | %s a %s", nrow(p),
+                  min(p$data), max(p$data)))
 }
 
-cat("\nOrganizados:", length(organizados), "de", length(candidatos), "\n")
-
-fonte_lista <- organizados
+cat("\nSeries obtidas:", length(series), "de", length(candidatos), "\n")
 
 
-# ---- padronizacao ----
-# o organize() devolve colunas date e rainfall_mm
-
-pega_col <- function(df, opcoes) {
-  hit <- intersect(opcoes, names(df))
-  if (length(hit) == 0) NA_character_ else hit[1]
-}
-
-padroniza <- function(df) {
-  cd <- pega_col(df, c("date", "data", "Data"))
-  cp <- pega_col(df, c("rainfall_mm", "value", "prec", "Total", "chuva"))
-  if (is.na(cd) || is.na(cp)) {
-    message("colunas disponiveis: ", paste(names(df), collapse = ", "))
-    return(NULL)
-  }
-  df %>% transmute(data = as.Date(.data[[cd]]),
-                   prec = as.numeric(.data[[cp]]))
-}
-
-
-# ---- avaliar cobertura ----
+# ------------------------------------------------------------
+# Avaliar cobertura DENTRO de 1981-2025
+# ------------------------------------------------------------
 
 dias_periodo <- as.numeric(FIM - INICIO) + 1
+anos_alvo    <- year(INICIO):year(FIM)
 
-avaliar <- function(df, codigo) {
-  s <- padroniza(df)
-  if (is.null(s)) { warning("colunas nao identificadas: ", codigo); return(NULL) }
-  s <- s %>% filter(data >= INICIO, data <= FIM)
-  if (nrow(s) == 0)
-    return(data.frame(station_code = as.character(codigo), inicio = NA,
-                      fim = NA, n_registros = 0L, n_com_dado = 0L,
-                      pct_cobertura = 0, max_prec = NA_real_))
+avaliar <- function(s, codigo) {
+  no_periodo <- s %>% filter(data >= INICIO, data <= FIM, !is.na(prec))
+
+  if (nrow(no_periodo) == 0) {
+    return(data.frame(
+      station_code = as.character(codigo),
+      serie_inicio = as.character(min(s$data)),
+      serie_fim    = as.character(max(s$data)),
+      inicio_periodo = NA_character_, fim_periodo = NA_character_,
+      dias_com_dado = 0L, pct_cobertura = 0,
+      anos_cobertos = 0L, anos_completos = 0L,
+      max_prec = NA_real_
+    ))
+  }
+
+  por_ano <- no_periodo %>%
+    mutate(ano = year(data)) %>%
+    count(ano, name = "dias")
+
   data.frame(
-    station_code  = as.character(codigo),
-    inicio        = as.character(min(s$data)),
-    fim           = as.character(max(s$data)),
-    n_registros   = nrow(s),
-    n_com_dado    = sum(!is.na(s$prec)),
-    pct_cobertura = round(100 * sum(!is.na(s$prec)) / dias_periodo, 1),
-    max_prec      = round(suppressWarnings(max(s$prec, na.rm = TRUE)), 1)
+    station_code   = as.character(codigo),
+    serie_inicio   = as.character(min(s$data)),
+    serie_fim      = as.character(max(s$data)),
+    inicio_periodo = as.character(min(no_periodo$data)),
+    fim_periodo    = as.character(max(no_periodo$data)),
+    dias_com_dado  = nrow(no_periodo),
+    pct_cobertura  = round(100 * nrow(no_periodo) / dias_periodo, 1),
+    anos_cobertos  = nrow(por_ano),                  # anos com algum dado
+    anos_completos = sum(por_ano$dias >= 350),       # anos praticamente cheios
+    max_prec       = round(max(no_periodo$prec), 1)
   )
 }
 
 resumo <- bind_rows(
-  lapply(seq_along(fonte_lista), function(i)
-    avaliar(fonte_lista[[i]], names(fonte_lista)[i]))
-)
+  lapply(seq_along(series), function(i)
+    avaliar(series[[i]], names(series)[i]))
+) %>%
+  left_join(inv_perto %>% mutate(station_code = as.character(station_code)),
+            by = "station_code") %>%
+  arrange(desc(anos_completos), desc(pct_cobertura))
 
-if (nrow(resumo) > 0) {
-  resumo <- resumo %>%
-    left_join(inv_perto %>% mutate(station_code = as.character(station_code)),
-              by = "station_code") %>%
-    arrange(desc(pct_cobertura))
-}
-
-cat("\n=========== COBERTURA DOS CANDIDATOS ===========\n")
-print(resumo)
+cat("\n========== COBERTURA EM 1981-2025 ==========\n")
+print(resumo %>% select(station_code, name, dist_km, serie_inicio, serie_fim,
+                        inicio_periodo, fim_periodo, dias_com_dado,
+                        pct_cobertura, anos_cobertos, anos_completos, max_prec))
 
 write.csv(resumo, file.path(DESTINO, "ana_candidatos.csv"), row.names = FALSE)
-# ---- B5. Escolher o posto e gravar ----
-# Critério, nesta ordem: cobertura temporal, taxa de falhas,
-# proximidade só como desempate. Um posto a 40 km com série
-# completa vale mais que um a 5 km que operou dez anos.
 
-CODIGO_ANA <- NA    # <-- preencha olhando a tabela acima
+
+# ------------------------------------------------------------
+# Recomendação automática
+# ------------------------------------------------------------
+
+viaveis <- resumo %>% filter(anos_completos >= 20)
+
+cat("\n================= RECOMENDACAO =================\n")
+
+if (nrow(viaveis) > 0) {
+  m <- viaveis[1, ]
+  cat(sprintf(
+"Melhor posto: %s - %s
+  distancia ao centroide : %.1f km
+  serie completa do posto: %s a %s
+  dentro de 1981-2025    : %s a %s
+  dias com dado          : %d de %d (%.1f%%)
+  anos com algum dado    : %d de %d
+  anos praticamente cheios (>=350 dias): %d
+  maior chuva diaria     : %.1f mm
+
+Preencha:  CODIGO_ANA <- %s\n",
+    m$station_code, m$name, m$dist_km,
+    m$serie_inicio, m$serie_fim,
+    m$inicio_periodo, m$fim_periodo,
+    m$dias_com_dado, dias_periodo, m$pct_cobertura,
+    m$anos_cobertos, length(anos_alvo), m$anos_completos,
+    m$max_prec, m$station_code))
+} else {
+  cat("Nenhum dos", N_CANDIDATOS, "postos tem 20+ anos completos no periodo.\n")
+  cat("Opcoes: aumentar N_CANDIDATOS (ha", nrow(inv_perto),
+      "postos em 50 km) ou seguir sem a ANA.\n")
+}
+
+
+# ------------------------------------------------------------
+# Cobertura ano a ano do melhor posto: onde estao os buracos
+# ------------------------------------------------------------
+
+if (nrow(viaveis) > 0) {
+  melhor <- viaveis$station_code[1]
+
+  cat("\n--- Dias com dado por ano | posto", melhor, "---\n")
+
+  series[[melhor]] %>%
+    filter(data >= INICIO, data <= FIM) %>%
+    mutate(ano = year(data)) %>%
+    group_by(ano) %>%
+    summarise(dias_com_dado = sum(!is.na(prec)), .groups = "drop") %>%
+    right_join(data.frame(ano = anos_alvo), by = "ano") %>%
+    mutate(dias_com_dado = ifelse(is.na(dias_com_dado), 0L, dias_com_dado),
+           situacao = case_when(
+             dias_com_dado >= 350 ~ "completo",
+             dias_com_dado >= 180 ~ "parcial",
+             dias_com_dado >    0 ~ "ruim",
+             TRUE                 ~ "sem dado")) %>%
+    as.data.frame() %>% print()
+}
+
+fonte_lista <- series   # o B5 usa isto
+
+# ---- B5. Escolher o posto e gravar ----
+# Olhe a recomendação impressa acima. Critério, nesta ordem:
+# anos_completos, pct_cobertura, distância só como desempate.
+
+CODIGO_ANA <- NA    # <-- preencha com o código do posto escolhido
 
 if (!is.na(CODIGO_ANA)) {
 
-  ana_dia <- padroniza(organizados[[as.character(CODIGO_ANA)]]) %>%
-    arrange(data)
+  ana_dia <- fonte_lista[[as.character(CODIGO_ANA)]] %>% arrange(data)
 
   # grade completa de dias: sem isso o buraco não vira NA e a
   # regra de falhas do bloco mensal não enxerga a ausência
@@ -273,8 +376,20 @@ if (!is.na(CODIGO_ANA)) {
   write.csv(falhas_ano, file.path(DESTINO, "ana_falhas_por_ano.csv"),
             row.names = FALSE)
 
+  # quantos blocos mensais sobrevivem à regra de MAX_FALHAS
+  MAX_FALHAS <- 3
+  blocos <- ana_dia %>%
+    mutate(ano = year(data), mes = month(data)) %>%
+    group_by(ano, mes) %>%
+    summarise(faltantes = sum(is.na(prec)), .groups = "drop") %>%
+    summarise(total = n(), validos = sum(faltantes <= MAX_FALHAS))
+
+  cat(sprintf("\nBlocos mensais utilizaveis: %d de %d (%.1f%%)\n",
+              blocos$validos, blocos$total,
+              100 * blocos$validos / blocos$total))
+
 } else {
-  message("\n>> Preencha CODIGO_ANA olhando ana_candidatos.csv e rode B5.")
+  message("\n>> Preencha CODIGO_ANA e rode o B5.")
 }
 
 
