@@ -1,0 +1,205 @@
+# ============================================================
+# Consolidação das 4 fontes de precipitação - Taquari / RS
+# CHIRPS | NASA_POWER | BR_DWGD | ANA (posto 2951024)
+#
+# Lê os CSVs diários e recalcula, com regra idêntica para todas:
+#   maximos_mensais_long.csv
+#   maximos_mensais_wide.csv
+#   cobertura.csv
+#   blocos_descartados.csv
+#   periodo_comum.csv
+#   metadados_fontes.csv
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+BASE    <- "C:/Users/Patrick Filho/OneDrive/Área de Trabalho/LabMA/SIAC/1. Dados/1. V1"
+DIARIO  <- file.path(BASE, "diario")
+SAIDA   <- file.path(BASE, "todas_fontes")
+
+INICIO     <- as.Date("1981-01-01")
+FIM        <- as.Date("2025-12-31")
+MAX_FALHAS <- 3
+
+dir.create(SAIDA, showWarnings = FALSE, recursive = TRUE)
+stopifnot(dir.exists(DIARIO))
+
+
+# ------------------------------------------------------------
+# 1. Ler as séries diárias
+# ------------------------------------------------------------
+
+arquivos <- list.files(DIARIO, pattern = "\\.csv$", full.names = TRUE)
+fontes   <- tools::file_path_sans_ext(basename(arquivos))
+
+cat("Fontes encontradas:", paste(fontes, collapse = ", "), "\n\n")
+
+diarios <- setNames(
+  lapply(arquivos, function(f) {
+    read.csv(f) %>%
+      mutate(data = as.Date(data), prec = as.numeric(prec)) %>%
+      filter(data >= INICIO, data <= FIM) %>%
+      distinct(data, .keep_all = TRUE) %>%
+      arrange(data)
+  }),
+  fontes
+)
+
+for (f in fontes) {
+  d <- diarios[[f]]
+  cat(sprintf("%-12s %6d dias | %s a %s | %d NA\n",
+              f, nrow(d), min(d$data), max(d$data), sum(is.na(d$prec))))
+}
+
+
+# ------------------------------------------------------------
+# 2. Máximos mensais - regra idêntica para as 4 fontes
+# ------------------------------------------------------------
+# Bloco com mais de MAX_FALHAS dias ausentes é descartado.
+# Sem isso, mês incompleto entra com máximo baixo e achata a
+# cauda da GEV, criando viés que parece diferença entre fontes.
+
+maximos_mensais <- function(df, fonte) {
+  # grade completa: dia ausente precisa aparecer como NA
+  grade <- data.frame(data = seq(INICIO, FIM, by = "day"))
+  df <- left_join(grade, df, by = "data")
+  
+  df %>%
+    mutate(ano = year(data), mes = month(data)) %>%
+    group_by(ano, mes) %>%
+    summarise(
+      dias_esperados = as.integer(days_in_month(
+        as.Date(sprintf("%d-%02d-01", first(ano), first(mes))))),
+      dias_com_dado  = sum(!is.na(prec)),
+      falhas         = dias_esperados - sum(!is.na(prec)),
+      max_prec       = if (any(!is.na(prec))) max(prec, na.rm = TRUE) else NA_real_,
+      data_do_max    = if (any(!is.na(prec)))
+        data[which.max(replace(prec, is.na(prec), -Inf))]
+      else as.Date(NA),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      fonte   = fonte,
+      ano_mes = sprintf("%d-%02d", ano, mes),
+      valido  = falhas <= MAX_FALHAS & !is.na(max_prec)
+    )
+}
+
+max_all <- bind_rows(
+  lapply(fontes, function(f) maximos_mensais(diarios[[f]], f))
+)
+
+
+# ------------------------------------------------------------
+# 3. Cobertura
+# ------------------------------------------------------------
+
+n_meses <- length(seq(INICIO, FIM, by = "month"))   # 540
+
+cobertura <- max_all %>%
+  group_by(fonte) %>%
+  summarise(
+    inicio          = if (any(valido)) min(ano_mes[valido]) else NA_character_,
+    fim             = if (any(valido)) max(ano_mes[valido]) else NA_character_,
+    blocos_validos  = sum(valido),
+    blocos_totais   = n(),
+    blocos_perdidos = sum(!valido),
+    max_observado   = round(max(max_prec, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  mutate(meses_no_intervalo = n_meses,
+         cobertura_pct      = round(100 * blocos_validos / n_meses, 1)) %>%
+  arrange(desc(cobertura_pct))
+
+cat("\n================ COBERTURA ================\n")
+print(as.data.frame(cobertura))
+
+
+# ------------------------------------------------------------
+# 4. Blocos descartados
+# ------------------------------------------------------------
+
+descartados <- max_all %>%
+  filter(!valido) %>%
+  select(fonte, ano_mes, dias_esperados, dias_com_dado, falhas) %>%
+  arrange(fonte, ano_mes)
+
+cat("\nBlocos descartados por fonte:\n")
+print(table(descartados$fonte))
+
+
+# ------------------------------------------------------------
+# 5. Formato largo + período comum
+# ------------------------------------------------------------
+
+max_wide <- max_all %>%
+  filter(valido) %>%
+  select(ano_mes, ano, mes, fonte, max_prec) %>%
+  pivot_wider(names_from = fonte, values_from = max_prec) %>%
+  arrange(ano_mes)
+
+cols_fonte <- setdiff(names(max_wide), c("ano_mes", "ano", "mes"))
+
+max_wide <- max_wide %>%
+  mutate(n_fontes = rowSums(!is.na(across(all_of(cols_fonte)))))
+
+completos <- max_wide %>% filter(n_fontes == length(cols_fonte))
+
+cat(sprintf("\nBlocos com TODAS as %d fontes: %d\n",
+            length(cols_fonte), nrow(completos)))
+if (nrow(completos) > 0)
+  cat(sprintf("Periodo comum: %s a %s\n",
+              min(completos$ano_mes), max(completos$ano_mes)))
+
+periodo_comum <- data.frame(
+  n_fontes = length(cols_fonte),
+  blocos_completos = nrow(completos),
+  inicio = if (nrow(completos)) min(completos$ano_mes) else NA,
+  fim    = if (nrow(completos)) max(completos$ano_mes) else NA
+)
+
+cat("\nBlocos por numero de fontes disponiveis:\n")
+print(table(max_wide$n_fontes))
+
+
+# ------------------------------------------------------------
+# 6. Metadados - o que cada fonte mede
+# ------------------------------------------------------------
+
+metadados <- data.frame(
+  fonte = c("CHIRPS", "NASA_POWER", "BR_DWGD", "ANA"),
+  tipo = c("satelite IR + estacoes", "reanalise MERRA-2",
+           "interpolacao de estacoes", "pluviometro"),
+  natureza = c("media areal", "media areal", "media areal", "pontual"),
+  resolucao = c("0.05 grau (~5,3 km)", "~0.5 grau", "0.1 grau (~11 km)",
+                "ponto (posto 2951024)"),
+  extracao = c("celula do centroide", "celula do centroide",
+               "media zonal do municipio", "posto a 45 km aprox."),
+  periodo_disponivel = c("1981-2025", "1981-2025", "1961-2020-07", "1970-2026"),
+  stringsAsFactors = FALSE
+) %>%
+  filter(fonte %in% fontes)
+
+
+# ------------------------------------------------------------
+# 7. Gravar
+# ------------------------------------------------------------
+
+write.csv(max_all,       file.path(SAIDA, "maximos_mensais_long.csv"), row.names = FALSE)
+write.csv(max_wide,      file.path(SAIDA, "maximos_mensais_wide.csv"), row.names = FALSE)
+write.csv(cobertura,     file.path(SAIDA, "cobertura.csv"),            row.names = FALSE)
+write.csv(descartados,   file.path(SAIDA, "blocos_descartados.csv"),   row.names = FALSE)
+write.csv(periodo_comum, file.path(SAIDA, "periodo_comum.csv"),        row.names = FALSE)
+write.csv(metadados,     file.path(SAIDA, "metadados_fontes.csv"),     row.names = FALSE)
+
+cat("\nGravado em:", SAIDA, "\n")
+print(list.files(SAIDA))
+
+cat("\nResumo dos maximos mensais:\n")
+print(summary(max_wide[, cols_fonte]))
+
+cat("\nCorrelacao entre fontes (blocos completos):\n")
+if (nrow(completos) > 10)
+  print(round(cor(completos[, cols_fonte], use = "complete.obs"), 3))
