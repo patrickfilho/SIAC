@@ -1,0 +1,624 @@
+# ============================================================
+# EXTRAÇÃO CHIRPS - TAQUARI / RS
+# Grade 5 x 5 ao redor do centroide
+#
+# OBJETIVO:
+#   Baixar SOMENTE os dados diários brutos do CHIRPS.
+#   Nenhuma agregação semanal/mensal é feita aqui.
+#
+# PERÍODO:
+#   2006-01-01 a 2025-12-31
+#
+# RESOLUÇÃO:
+#   0.05 grau (~5 km, aproximadamente)
+#
+# RESULTADO:
+#   25 células x dias do período
+# ============================================================
+
+
+# ============================================================
+# 0. PACOTES
+# ============================================================
+
+pacotes <- c(
+  "geobr",
+  "sf",
+  "dplyr",
+  "lubridate",
+  "chirps"
+)
+
+novos <- pacotes[
+  !pacotes %in% rownames(installed.packages())
+]
+
+if (length(novos) > 0) {
+  install.packages(novos)
+}
+
+library(geobr)
+library(sf)
+library(dplyr)
+library(lubridate)
+library(chirps)
+
+
+# ============================================================
+# 1. PARÂMETROS
+# ============================================================
+
+INICIO <- as.Date("2006-01-01")
+FIM    <- as.Date("2025-12-31")
+
+# resolução espacial do CHIRPS
+RES_CHIRPS <- 0.05
+
+# número de células por lado
+N_GRADE <- 5
+
+# pasta onde tudo será salvo
+DESTINO <- "C:/Users/Patrick Filho/OneDrive/Área de Trabalho/LabMA/SIAC/CHIRPS_5x5"
+
+dir.create(
+  DESTINO,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+dir.create(
+  file.path(DESTINO, "por_ano"),
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+
+# ============================================================
+# 2. MUNICÍPIO DE TAQUARI
+# ============================================================
+
+mun_rs <- geobr::read_municipality(
+  code_muni = "RS",
+  year = 2020
+)
+
+taquari <- mun_rs |>
+  dplyr::filter(name_muni == "Taquari")
+
+COD_IBGE <- taquari$code_muni[1]
+
+
+# ============================================================
+# 3. CENTROIDE
+# ============================================================
+
+centro <- suppressWarnings(
+  sf::st_centroid(taquari)
+)
+
+xy <- sf::st_coordinates(centro)
+
+LON_CENTRO <- xy[1, "X"]
+LAT_CENTRO <- xy[1, "Y"]
+
+cat("\n============================================\n")
+cat("TAQUARI / RS\n")
+cat("============================================\n")
+
+cat(
+  sprintf(
+    "Centroide: longitude %.5f | latitude %.5f\n",
+    LON_CENTRO,
+    LAT_CENTRO
+  )
+)
+
+
+# ============================================================
+# 4. CONSTRUIR GRADE 5 x 5
+# ============================================================
+#
+# A célula central é identificada como:
+#
+#       linha = 0
+#       coluna = 0
+#
+# Os deslocamentos serão:
+#
+#       -2  -1   0   +1   +2
+#
+# em longitude e latitude.
+#
+# Cada passo corresponde a 0.05 grau.
+# ============================================================
+
+offsets <- seq(
+  from = -2,
+  to   =  2
+)
+
+grade <- expand.grid(
+  coluna = offsets,
+  linha  = offsets
+) |>
+  dplyr::mutate(
+
+    lon = LON_CENTRO +
+      coluna * RES_CHIRPS,
+
+    lat = LAT_CENTRO +
+      linha * RES_CHIRPS,
+
+    id_celula = sprintf(
+      "R%+d_C%+d",
+      linha,
+      coluna
+    ),
+
+    central = (
+      linha == 0 &
+      coluna == 0
+    )
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(linha),
+    coluna
+  ) |>
+  dplyr::mutate(
+    id = dplyr::row_number()
+  )
+
+
+# ============================================================
+# 5. CONFERÊNCIA DA GRADE
+# ============================================================
+
+cat("\nGrade criada:\n")
+print(
+  grade |>
+    dplyr::select(
+      id,
+      id_celula,
+      linha,
+      coluna,
+      lon,
+      lat,
+      central
+    )
+)
+
+cat(
+  "\nNúmero de células:",
+  nrow(grade),
+  "\n"
+)
+
+
+# ============================================================
+# 6. SALVAR A GRADE
+# ============================================================
+
+write.csv(
+  grade,
+  file.path(
+    DESTINO,
+    "grade_CHIRPS_5x5.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 7. OBJETO ENVIADO AO CHIRPS
+# ============================================================
+
+pontos_chirps <- grade |>
+  dplyr::select(
+    lon,
+    lat
+  )
+
+
+# ============================================================
+# 8. EXTRAÇÃO ANO A ANO
+# ============================================================
+#
+# IMPORTANTE:
+#
+# - As 25 células são enviadas JUNTAS.
+#
+# - Cada ano é salvo imediatamente.
+#
+# - Se o processo for interrompido, os anos já existentes
+#   NÃO são baixados novamente.
+#
+# ============================================================
+
+anos <- lubridate::year(INICIO):
+  lubridate::year(FIM)
+
+tempo_inicio <- Sys.time()
+
+for (a in anos) {
+
+  ini <- max(
+    as.Date(
+      sprintf("%d-01-01", a)
+    ),
+    INICIO
+  )
+
+  fim <- min(
+    as.Date(
+      sprintf("%d-12-31", a)
+    ),
+    FIM
+  )
+
+  arquivo_ano <- file.path(
+    DESTINO,
+    "por_ano",
+    paste0(
+      "CHIRPS_5x5_",
+      a,
+      ".csv"
+    )
+  )
+
+
+  # ----------------------------------------------------------
+  # Se já existe, pula o ano
+  # ----------------------------------------------------------
+
+  if (file.exists(arquivo_ano)) {
+
+    message(
+      "CHIRPS ",
+      a,
+      " já existe -> pulando"
+    )
+
+    next
+  }
+
+
+  # ----------------------------------------------------------
+  # Download
+  # ----------------------------------------------------------
+
+  message(
+    "\n========================================"
+  )
+
+  message(
+    "Baixando CHIRPS ",
+    a,
+    " | ",
+    ini,
+    " até ",
+    fim
+  )
+
+  message(
+    "25 células simultaneamente"
+  )
+
+  inicio_ano <- Sys.time()
+
+
+  r <- try(
+
+    chirps::get_chirps(
+
+      pontos_chirps,
+
+      dates = c(
+        as.character(ini),
+        as.character(fim)
+      ),
+
+      server = "CHC",
+
+      resolution = RES_CHIRPS,
+
+      as.matrix = FALSE
+
+    ),
+
+    silent = TRUE
+
+  )
+
+
+  # ----------------------------------------------------------
+  # Em caso de erro
+  # ----------------------------------------------------------
+
+  if (inherits(r, "try-error")) {
+
+    warning(
+      "Falha no ano ",
+      a,
+      ". O restante continuará."
+    )
+
+    next
+  }
+
+
+  # ==========================================================
+  # 9. PADRONIZAR RESULTADO
+  # ==========================================================
+
+  r <- r |>
+    dplyr::mutate(
+
+      id = as.integer(id),
+
+      date = as.Date(date),
+
+      chirps = as.numeric(chirps),
+
+      chirps = dplyr::if_else(
+        chirps < 0,
+        NA_real_,
+        chirps
+      )
+    ) |>
+
+    dplyr::left_join(
+
+      grade |>
+        dplyr::select(
+          id,
+          id_celula,
+          linha,
+          coluna,
+          central
+        ),
+
+      by = "id"
+
+    ) |>
+
+    dplyr::select(
+      id,
+      id_celula,
+      linha,
+      coluna,
+      central,
+      lon,
+      lat,
+      date,
+      chirps
+    ) |>
+
+    dplyr::arrange(
+      date,
+      id
+    )
+
+
+  # ==========================================================
+  # 10. SALVAR O ANO IMEDIATAMENTE
+  # ==========================================================
+
+  write.csv(
+    r,
+    arquivo_ano,
+    row.names = FALSE
+  )
+
+
+  fim_ano <- Sys.time()
+
+  duracao <- difftime(
+    fim_ano,
+    inicio_ano,
+    units = "mins"
+  )
+
+
+  message(
+    "Ano ",
+    a,
+    " concluído."
+  )
+
+  message(
+    "Linhas: ",
+    nrow(r)
+  )
+
+  message(
+    "Tempo: ",
+    round(
+      as.numeric(duracao),
+      1
+    ),
+    " minutos"
+  )
+}
+
+
+# ============================================================
+# 11. JUNTAR TODOS OS ANOS
+# ============================================================
+
+arquivos <- list.files(
+  file.path(
+    DESTINO,
+    "por_ano"
+  ),
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+if (length(arquivos) == 0) {
+
+  stop(
+    "Nenhum arquivo anual foi baixado."
+  )
+}
+
+
+lista <- lapply(
+  arquivos,
+  read.csv
+)
+
+chirps_bruto <- dplyr::bind_rows(
+  lista
+) |>
+  dplyr::mutate(
+    date = as.Date(date)
+  ) |>
+  dplyr::arrange(
+    date,
+    id
+  )
+
+
+# ============================================================
+# 12. SALVAR BASE COMPLETA
+# ============================================================
+
+arquivo_final <- file.path(
+  DESTINO,
+  "CHIRPS_Taquari_5x5_diario_2006_2025.csv"
+)
+
+write.csv(
+  chirps_bruto,
+  arquivo_final,
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 13. SALVAR PARÂMETROS DA EXTRAÇÃO
+# ============================================================
+
+parametros <- data.frame(
+
+  municipio = "Taquari",
+
+  uf = "RS",
+
+  cod_ibge = COD_IBGE,
+
+  longitude_centro = LON_CENTRO,
+
+  latitude_centro = LAT_CENTRO,
+
+  resolucao_graus = RES_CHIRPS,
+
+  grade = paste0(
+    N_GRADE,
+    "x",
+    N_GRADE
+  ),
+
+  numero_celulas = nrow(grade),
+
+  inicio = as.character(INICIO),
+
+  fim = as.character(FIM),
+
+  fonte = "CHIRPS",
+
+  servidor = "CHC"
+)
+
+write.csv(
+  parametros,
+  file.path(
+    DESTINO,
+    "parametros_extracao.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 14. RELATÓRIO FINAL
+# ============================================================
+
+tempo_fim <- Sys.time()
+
+cat(
+  "\n\n============================================\n"
+)
+
+cat(
+  "EXTRAÇÃO FINALIZADA\n"
+)
+
+cat(
+  "============================================\n"
+)
+
+cat(
+  "Período:",
+  as.character(INICIO),
+  "a",
+  as.character(FIM),
+  "\n"
+)
+
+cat(
+  "Células:",
+  length(
+    unique(
+      chirps_bruto$id_celula
+    )
+  ),
+  "\n"
+)
+
+cat(
+  "Dias:",
+  length(
+    unique(
+      chirps_bruto$date
+    )
+  ),
+  "\n"
+)
+
+cat(
+  "Total de observações:",
+  nrow(chirps_bruto),
+  "\n"
+)
+
+cat(
+  "Valores ausentes:",
+  sum(
+    is.na(
+      chirps_bruto$chirps
+    )
+  ),
+  "\n"
+)
+
+cat(
+  "Tempo total:",
+  round(
+    as.numeric(
+      difftime(
+        tempo_fim,
+        tempo_inicio,
+        units = "hours"
+      )
+    ),
+    2
+  ),
+  "horas\n"
+)
+
+cat(
+  "\nArquivo final:\n",
+  arquivo_final,
+  "\n"
+)
