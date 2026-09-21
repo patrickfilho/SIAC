@@ -1,0 +1,450 @@
+# ============================================================
+# PARTE 1 - COBERTURA MUNICIPIO x GRADE CHIRPS
+#
+# Objetivo:
+# 1. Ler os 25 centroides CHIRPS
+# 2. Construir os 25 poligonos das celulas
+# 3. Baixar os municipios do RS via geobr
+# 4. Calcular:
+#    - quanto de cada municipio esta em cada grade
+#    - quanto de cada municipio esta dentro do footprint total
+# 5. Exportar:
+#    - municipio_grade_percentual.csv
+#    - cobertura_municipios_footprint.csv
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+# Rode apenas uma vez, se necessario:
+# install.packages(c(
+#   "geobr",
+#   "sf",
+#   "dplyr",
+#   "readr",
+#   "units"
+# ))
+
+library(geobr)
+library(sf)
+library(dplyr)
+library(readr)
+library(units)
+
+
+# ------------------------------------------------------------
+# 1. CAMINHO DO CSV DAS GRADES
+# ------------------------------------------------------------
+
+# Ajuste o caminho se necessario.
+arquivo_chirps <- "grade_CHIRPS_5x5.csv"
+
+
+# ------------------------------------------------------------
+# 2. LER O CSV DOS CENTROIDES
+# ------------------------------------------------------------
+
+chirps <- read_csv(
+  arquivo_chirps,
+  show_col_types = FALSE
+)
+
+# Conferencias basicas
+print(chirps)
+print(names(chirps))
+print(dim(chirps))
+
+# Esperamos 25 celulas
+stopifnot(nrow(chirps) == 25)
+
+
+# ------------------------------------------------------------
+# 3. BAIXAR MALHA MUNICIPAL DO RS
+# ------------------------------------------------------------
+
+# O geobr retorna um objeto sf.
+# Ano 2020 e uma opcao estavel para a malha municipal.
+
+municipios <- geobr::read_municipality(
+  code_muni = "RS",
+  year = 2020
+)
+
+
+# ------------------------------------------------------------
+# 4. PADRONIZAR NOMES DAS COLUNAS
+# ------------------------------------------------------------
+
+municipios <- municipios %>%
+  select(
+    codigo_municipio = code_muni,
+    municipio = name_muni,
+    geometry
+  ) %>%
+  st_make_valid()
+
+
+# ------------------------------------------------------------
+# 5. GARANTIR CRS GEOGRAFICO WGS84
+# ------------------------------------------------------------
+
+municipios_wgs84 <- st_transform(
+  municipios,
+  crs = 4326
+)
+
+
+# ------------------------------------------------------------
+# 6. CONSTRUIR OS POLIGONOS DAS 25 CELULAS CHIRPS
+# ------------------------------------------------------------
+
+# Resolucao espacial assumida:
+# 0.05 graus x 0.05 graus
+#
+# Como lon e lat representam o centro da celula:
+# metade da celula = 0.025 graus
+
+half_res <- 0.025
+
+
+criar_celula <- function(lon, lat, half_size = 0.025) {
+
+  coords <- matrix(
+    c(
+      lon - half_size, lat - half_size,
+      lon + half_size, lat - half_size,
+      lon + half_size, lat + half_size,
+      lon - half_size, lat + half_size,
+      lon - half_size, lat - half_size
+    ),
+    ncol = 2,
+    byrow = TRUE
+  )
+
+  st_polygon(
+    list(coords)
+  )
+}
+
+
+# Criar uma geometria por linha do CSV
+lista_geometrias <- lapply(
+  seq_len(nrow(chirps)),
+  function(i) {
+
+    criar_celula(
+      lon = chirps$lon[i],
+      lat = chirps$lat[i],
+      half_size = half_res
+    )
+
+  }
+)
+
+
+# Converter para objeto sf
+grades <- st_sf(
+  chirps,
+  geometry = st_sfc(
+    lista_geometrias,
+    crs = 4326
+  )
+)
+
+
+# ------------------------------------------------------------
+# 7. REPROJETAR PARA SISTEMA METRICO
+# ------------------------------------------------------------
+
+# SIRGAS 2000 / UTM zone 22S
+# Adequado para a regiao de Taquari/RS.
+
+epsg_utm <- 31982
+
+
+grades_utm <- st_transform(
+  grades,
+  crs = epsg_utm
+)
+
+
+municipios_utm <- st_transform(
+  municipios_wgs84,
+  crs = epsg_utm
+)
+
+
+# ------------------------------------------------------------
+# 8. CRIAR FOOTPRINT TOTAL DAS 25 GRADES
+# ------------------------------------------------------------
+
+footprint <- grades_utm %>%
+  summarise()
+
+
+# ------------------------------------------------------------
+# 9. FILTRAR SOMENTE MUNICIPIOS QUE INTERSECTAM O FOOTPRINT
+# ------------------------------------------------------------
+
+idx_municipios <- st_intersects(
+  municipios_utm,
+  footprint,
+  sparse = FALSE
+)[, 1]
+
+
+municipios_area <- municipios_utm[
+  idx_municipios,
+]
+
+
+cat(
+  "\nNumero de municipios que intersectam o footprint:",
+  nrow(municipios_area),
+  "\n\n"
+)
+
+
+print(
+  municipios_area %>%
+    st_drop_geometry() %>%
+    arrange(municipio)
+)
+
+
+# ------------------------------------------------------------
+# 10. CALCULAR AREA TOTAL DE CADA MUNICIPIO
+# ------------------------------------------------------------
+
+area_municipios <- municipios_area %>%
+  mutate(
+
+    area_municipio_m2 =
+      st_area(geometry),
+
+    area_municipio_km2 =
+      as.numeric(
+        set_units(
+          area_municipio_m2,
+          km^2
+        )
+      )
+
+  ) %>%
+  st_drop_geometry() %>%
+  select(
+    codigo_municipio,
+    municipio,
+    area_municipio_m2,
+    area_municipio_km2
+  )
+
+
+# ------------------------------------------------------------
+# 11. INTERSECAO ENTRE GRADES E MUNICIPIOS
+# ------------------------------------------------------------
+
+intersecoes_mun_grid <- st_intersection(
+  grades_utm,
+  municipios_area
+)
+
+
+# ------------------------------------------------------------
+# 12. CALCULAR AREA DE CADA INTERSECAO
+# ------------------------------------------------------------
+
+intersecoes_mun_grid <- intersecoes_mun_grid %>%
+  mutate(
+
+    area_intersec_m2 =
+      st_area(geometry),
+
+    area_intersec_km2 =
+      as.numeric(
+        set_units(
+          area_intersec_m2,
+          km^2
+        )
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 13. ADICIONAR AREA TOTAL DO MUNICIPIO
+# ------------------------------------------------------------
+
+resultado_municipio_grade <- intersecoes_mun_grid %>%
+  left_join(
+    area_municipios,
+    by = c(
+      "codigo_municipio",
+      "municipio"
+    )
+  )
+
+
+# ------------------------------------------------------------
+# 14. CALCULAR % DO MUNICIPIO EM CADA GRADE
+# ------------------------------------------------------------
+
+resultado_municipio_grade <- resultado_municipio_grade %>%
+  mutate(
+
+    prop_municipio_na_grade =
+      as.numeric(area_intersec_m2) /
+      as.numeric(area_municipio_m2),
+
+    pct_municipio_na_grade =
+      100 *
+      prop_municipio_na_grade
+
+  )
+
+
+# ------------------------------------------------------------
+# 15. TABELA MUNICIPIO x GRADE
+# ------------------------------------------------------------
+
+tabela_municipio_grade <- resultado_municipio_grade %>%
+  st_drop_geometry() %>%
+  select(
+    id,
+    id_celula,
+    linha,
+    coluna,
+    lon,
+    lat,
+    central,
+    codigo_municipio,
+    municipio,
+    area_municipio_km2,
+    area_intersec_km2,
+    prop_municipio_na_grade,
+    pct_municipio_na_grade
+  ) %>%
+  arrange(
+    municipio,
+    desc(pct_municipio_na_grade)
+  )
+
+
+cat(
+  "\nTabela municipio x grade:\n"
+)
+
+print(
+  tabela_municipio_grade,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 16. CALCULAR COBERTURA TOTAL DE CADA MUNICIPIO
+#     DENTRO DAS 25 GRADES
+# ------------------------------------------------------------
+
+cobertura_municipio <- tabela_municipio_grade %>%
+  group_by(
+    codigo_municipio,
+    municipio
+  ) %>%
+  summarise(
+
+    area_municipio_km2 =
+      first(area_municipio_km2),
+
+    area_dentro_grades_km2 =
+      sum(
+        area_intersec_km2,
+        na.rm = TRUE
+      ),
+
+    prop_municipio_no_footprint =
+      sum(
+        prop_municipio_na_grade,
+        na.rm = TRUE
+      ),
+
+    pct_municipio_no_footprint =
+      sum(
+        pct_municipio_na_grade,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
+
+  ) %>%
+  arrange(
+    desc(pct_municipio_no_footprint)
+  )
+
+
+cat(
+  "\nCobertura total dos municipios no footprint:\n"
+)
+
+print(
+  cobertura_municipio,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 17. CHECAGEM DE CONSISTENCIA
+# ------------------------------------------------------------
+
+# Nenhum municipio pode ter mais de ~100% de cobertura.
+
+checagem <- cobertura_municipio %>%
+  filter(
+    pct_municipio_no_footprint > 100.1
+  )
+
+
+if (nrow(checagem) == 0) {
+
+  cat(
+    "\nOK: nenhuma cobertura municipal ultrapassa 100%.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: existem municipios com cobertura acima de 100%.\n"
+  )
+
+  print(checagem)
+
+}
+
+
+# ------------------------------------------------------------
+# 18. EXPORTAR RESULTADOS
+# ------------------------------------------------------------
+
+write_csv(
+  tabela_municipio_grade,
+  "municipio_grade_percentual.csv"
+)
+
+write_csv(
+  cobertura_municipio,
+  "cobertura_municipios_footprint.csv"
+)
+
+
+cat(
+  "\nArquivos salvos com sucesso:\n",
+  "- municipio_grade_percentual.csv\n",
+  "- cobertura_municipios_footprint.csv\n"
+)
+
+cat(
+  "\nDiretorio onde os arquivos foram salvos:\n",
+  getwd(),
+  "\n"
+)
