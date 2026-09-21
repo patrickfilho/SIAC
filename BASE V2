@@ -1,1 +1,530 @@
+# ============================================================
+# PARTE 3 - GERAR BASE_TRATADA_V2
+#
+# Entradas:
+# 1. CHIRPS_Taquari_5x5_mensal_2001_2025 (1).csv
+# 2. desastre_grade_mes.csv
+#
+# Saida:
+# base_tratada_v2.csv
+#
+# Estrutura final:
+#
+# X1 = prec_mensal_soma
+# X2 = prec_mensal_max
+# X3 = dias_acima_threshold
+# E  = exposicao
+# Y  = desastre_natural
+# ============================================================
 
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+library(dplyr)
+library(readr)
+
+
+# ------------------------------------------------------------
+# 1. CAMINHOS DOS ARQUIVOS
+# ------------------------------------------------------------
+
+arquivo_chirps <-
+  "CHIRPS_Taquari_5x5_mensal_2001_2025 (1).csv"
+
+arquivo_desastres <-
+  "desastre_grade_mes.csv"
+
+
+# ------------------------------------------------------------
+# 2. LER BASE CHIRPS MENSAL
+# ------------------------------------------------------------
+
+base_mensal <- read_csv(
+  arquivo_chirps,
+  show_col_types = FALSE
+)
+
+
+cat(
+  "\nDimensao CHIRPS original:\n"
+)
+
+print(
+  dim(base_mensal)
+)
+
+
+cat(
+  "\nColunas CHIRPS:\n"
+)
+
+print(
+  names(base_mensal)
+)
+
+
+# ------------------------------------------------------------
+# 3. GARANTIR TIPOS DE ANO E MES
+# ------------------------------------------------------------
+
+base_mensal <- base_mensal %>%
+
+  mutate(
+
+    ano =
+      as.integer(ano),
+
+    mes =
+      as.integer(mes)
+
+  )
+
+
+# ------------------------------------------------------------
+# 4. IDENTIFICAR ANOS BISSEXTOS
+# ------------------------------------------------------------
+
+base_mensal <- base_mensal %>%
+
+  mutate(
+
+    bissexto =
+
+      (
+        ano %% 4 == 0 &
+        ano %% 100 != 0
+      ) |
+
+      (
+        ano %% 400 == 0
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 5. NUMERO DE DIAS DO ANO
+# ------------------------------------------------------------
+
+base_mensal <- base_mensal %>%
+
+  mutate(
+
+    dias_ano =
+      if_else(
+        bissexto,
+        366L,
+        365L
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 6. NUMERO DE DIAS DO MES
+# ------------------------------------------------------------
+
+base_mensal <- base_mensal %>%
+
+  mutate(
+
+    dias_mes =
+      case_when(
+
+        mes %in%
+          c(
+            1, 3, 5, 7,
+            8, 10, 12
+          ) ~ 31L,
+
+        mes %in%
+          c(
+            4, 6, 9, 11
+          ) ~ 30L,
+
+        mes == 2 &
+          bissexto ~ 29L,
+
+        mes == 2 &
+          !bissexto ~ 28L,
+
+        TRUE ~ NA_integer_
+
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 7. CALCULAR EXPOSICAO
+# ------------------------------------------------------------
+
+# Interpretacao:
+#
+# E_{g,t} =
+# fracao do ano correspondente aquele mes
+#
+# Em cada grid-ano:
+#
+# soma(E) = 1
+
+base_mensal <- base_mensal %>%
+
+  mutate(
+
+    exposicao =
+      dias_mes /
+      dias_ano
+
+  )
+
+
+# ------------------------------------------------------------
+# 8. CHECAR EXPOSICAO
+# ------------------------------------------------------------
+
+checagem_exposicao <- base_mensal %>%
+
+  group_by(
+    id_celula,
+    ano
+  ) %>%
+
+  summarise(
+
+    soma_exposicao =
+      sum(
+        exposicao,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
+
+  )
+
+
+cat(
+  "\nResumo da soma anual da exposicao:\n"
+)
+
+print(
+  summary(
+    checagem_exposicao$soma_exposicao
+  )
+)
+
+
+# ------------------------------------------------------------
+# 9. CHECAR ANOS BISSEXTOS
+# ------------------------------------------------------------
+
+anos_bissextos <- base_mensal %>%
+
+  filter(
+    bissexto
+  ) %>%
+
+  distinct(
+    ano
+  ) %>%
+
+  arrange(
+    ano
+  )
+
+
+cat(
+  "\nAnos bissextos encontrados:\n"
+)
+
+print(
+  anos_bissextos
+)
+
+
+# Esperado:
+#
+# 2004
+# 2008
+# 2012
+# 2016
+# 2020
+# 2024
+
+
+# ------------------------------------------------------------
+# 10. LER Y = DESASTRES POR GRADE-MES
+# ------------------------------------------------------------
+
+desastres <- read_csv(
+  arquivo_desastres,
+  show_col_types = FALSE
+)
+
+
+desastres <- desastres %>%
+
+  mutate(
+
+    ano =
+      as.integer(ano),
+
+    mes =
+      as.integer(mes)
+
+  )
+
+
+cat(
+  "\nTotal de desastres antes do join:\n"
+)
+
+print(
+  sum(
+    desastres$desastre_natural,
+    na.rm = TRUE
+  )
+)
+
+
+# ------------------------------------------------------------
+# 11. LEFT JOIN
+# ------------------------------------------------------------
+
+base_tratada_v2 <- base_mensal %>%
+
+  left_join(
+
+    desastres,
+
+    by = c(
+      "id_celula",
+      "ano",
+      "mes"
+    )
+
+  )
+
+
+# ------------------------------------------------------------
+# 12. MESES SEM EVENTO = ZERO
+# ------------------------------------------------------------
+
+# NA aqui nao significa dado desconhecido.
+#
+# Significa simplesmente que nao apareceu nenhum evento
+# para aquela combinacao grade-ano-mes.
+
+base_tratada_v2 <- base_tratada_v2 %>%
+
+  mutate(
+
+    desastre_natural =
+      if_else(
+        is.na(desastre_natural),
+        0L,
+        as.integer(desastre_natural)
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 13. CHECAR NUMERO DE LINHAS
+# ------------------------------------------------------------
+
+cat(
+  "\nDimensao da base final:\n"
+)
+
+print(
+  dim(base_tratada_v2)
+)
+
+
+if (
+  nrow(base_tratada_v2) == 7500
+) {
+
+  cat(
+    "\nOK: a base continua com 7.500 observacoes.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: numero de linhas diferente de 7.500.\n"
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 14. CHECAR TOTAL DE Y
+# ------------------------------------------------------------
+
+total_y_final <-
+  sum(
+    base_tratada_v2$desastre_natural,
+    na.rm = TRUE
+  )
+
+
+total_y_original <-
+  sum(
+    desastres$desastre_natural,
+    na.rm = TRUE
+  )
+
+
+cat(
+  "\nTotal de desastres antes do join:",
+  total_y_original,
+  "\n"
+)
+
+cat(
+  "Total de desastres depois do join:",
+  total_y_final,
+  "\n"
+)
+
+
+if (
+  total_y_final ==
+  total_y_original
+) {
+
+  cat(
+    "\nOK: nenhum desastre foi perdido no join.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: houve alteracao no total de desastres.\n"
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 15. DISTRIBUICAO DE Y
+# ------------------------------------------------------------
+
+cat(
+  "\nDistribuicao de desastre_natural:\n"
+)
+
+print(
+
+  base_tratada_v2 %>%
+
+    count(
+      desastre_natural
+    ) %>%
+
+    arrange(
+      desastre_natural
+    )
+
+)
+
+
+# ------------------------------------------------------------
+# 16. RESUMO DAS VARIAVEIS PRINCIPAIS
+# ------------------------------------------------------------
+
+cat(
+  "\nResumo das variaveis do modelo:\n"
+)
+
+
+summary_modelo <- base_tratada_v2 %>%
+
+  select(
+
+    prec_mensal_soma,
+
+    prec_mensal_max,
+
+    dias_acima_threshold,
+
+    exposicao,
+
+    desastre_natural
+
+  )
+
+
+print(
+  summary(
+    summary_modelo
+  )
+)
+
+
+# ------------------------------------------------------------
+# 17. ORGANIZAR COLUNAS PRINCIPAIS
+# ------------------------------------------------------------
+
+# Nao excluimos necessariamente as outras colunas da base.
+# Apenas trazemos as mais importantes para frente.
+
+base_tratada_v2 <- base_tratada_v2 %>%
+
+  relocate(
+
+    id_celula,
+    ano,
+    mes,
+
+    prec_mensal_soma,
+    prec_mensal_max,
+    dias_acima_threshold,
+
+    dias_mes,
+    dias_ano,
+    exposicao,
+
+    desastre_natural
+
+  )
+
+
+# ------------------------------------------------------------
+# 18. SALVAR V2
+# ------------------------------------------------------------
+
+write_csv(
+
+  base_tratada_v2,
+
+  "base_tratada_v2.csv"
+
+)
+
+
+cat(
+  "\n=============================================\n"
+)
+
+cat(
+  "BASE V2 SALVA COM SUCESSO\n"
+)
+
+cat(
+  "Arquivo: base_tratada_v2.csv\n"
+)
+
+cat(
+  "Diretorio:",
+  getwd(),
+  "\n"
+)
+
+cat(
+  "=============================================\n"
+)
