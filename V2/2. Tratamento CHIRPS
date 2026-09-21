@@ -1,0 +1,245 @@
+# ============================================================
+# TRATAMENTO CHIRPS - TAQUARI / RS
+# Base diária 5x5 -> indicadores mensais
+#
+# Gera, para cada célula e mês:
+#   1) precipitação mensal acumulada
+#   2) máxima precipitação diária do mês
+#   3) número de dias acima de um threshold
+# ============================================================
+
+
+# ============================================================
+# 0. PACOTES
+# ============================================================
+
+library(dplyr)
+library(lubridate)
+
+
+# ============================================================
+# 1. PARÂMETROS
+# ============================================================
+
+# Defina aqui o threshold de precipitação diária, em mm
+THRESHOLD <- 50
+
+# Arquivo diário já extraído
+ARQUIVO_ENTRADA <- paste0(
+  "C:/Users/Patrick Filho/OneDrive/Área de Trabalho/",
+  "LabMA/SIAC/CHIRPS_5x5/",
+  "CHIRPS_Taquari_5x5_diario_2001_2025.csv"
+)
+
+# Arquivo mensal que será gerado
+ARQUIVO_SAIDA <- paste0(
+  "C:/Users/Patrick Filho/OneDrive/Área de Trabalho/",
+  "LabMA/SIAC/CHIRPS_5x5/",
+  "CHIRPS_Taquari_5x5_mensal_2001_2025.csv"
+)
+
+
+# ============================================================
+# 2. CARREGAR BASE DIÁRIA
+# ============================================================
+
+chirps_bruto <- read.csv(
+  ARQUIVO_ENTRADA
+)
+
+chirps_bruto <- chirps_bruto %>%
+  mutate(
+    date   = as.Date(date),
+    chirps = as.numeric(chirps)
+  )
+
+
+# ============================================================
+# 3. CONFERÊNCIA INICIAL
+# ============================================================
+
+cat(
+  "Linhas da base diária:",
+  nrow(chirps_bruto),
+  "\n"
+)
+
+cat(
+  "Número de células:",
+  length(unique(chirps_bruto$id_celula)),
+  "\n"
+)
+
+cat(
+  "Período:",
+  as.character(min(chirps_bruto$date)),
+  "a",
+  as.character(max(chirps_bruto$date)),
+  "\n\n"
+)
+
+
+# ============================================================
+# 4. CRIAR VARIÁVEIS DE ANO E MÊS
+# ============================================================
+
+chirps_diario <- chirps_bruto %>%
+  mutate(
+    ano = year(date),
+    mes = month(date)
+  )
+
+
+# ============================================================
+# 5. AGREGAR PARA O NÍVEL MENSAL
+# ============================================================
+
+chirps_mensal <- chirps_diario %>%
+  
+  group_by(
+    id,
+    id_celula,
+    linha,
+    coluna,
+    central,
+    lon,
+    lat,
+    ano,
+    mes
+  ) %>%
+  
+  summarise(
+    
+    # ----------------------------------------
+    # Número de dias disponíveis no mês
+    # ----------------------------------------
+    
+    dias_com_dado = sum(!is.na(chirps)),
+    
+    
+    # ----------------------------------------
+    # 1. Precipitação acumulada mensal
+    # ----------------------------------------
+    
+    prec_mensal_soma = if (
+      all(is.na(chirps))
+    ) {
+      NA_real_
+    } else {
+      sum(chirps, na.rm = TRUE)
+    },
+    
+    
+    # ----------------------------------------
+    # 2. Máxima precipitação diária do mês
+    # ----------------------------------------
+    
+    prec_mensal_max = if (
+      all(is.na(chirps))
+    ) {
+      NA_real_
+    } else {
+      max(chirps, na.rm = TRUE)
+    },
+    
+    
+    # ----------------------------------------
+    # 3. Número de dias acima do threshold
+    # ----------------------------------------
+    
+    dias_acima_threshold = if (
+      all(is.na(chirps))
+    ) {
+      NA_integer_
+    } else {
+      sum(
+        chirps > THRESHOLD,
+        na.rm = TRUE
+      )
+    },
+    
+    
+    .groups = "drop"
+  ) %>%
+  
+  mutate(
+    
+    ano_mes = sprintf(
+      "%04d-%02d",
+      ano,
+      mes
+    ),
+    
+    threshold_mm = THRESHOLD
+    
+  ) %>%
+  
+  arrange(
+    ano,
+    mes,
+    id
+  )
+
+
+# ============================================================
+# 6. CONFERÊNCIAS
+# ============================================================
+
+cat(
+  "Linhas da base mensal:",
+  nrow(chirps_mensal),
+  "\n"
+)
+
+cat(
+  "Meses distintos:",
+  length(unique(chirps_mensal$ano_mes)),
+  "\n"
+)
+
+cat(
+  "Células distintas:",
+  length(unique(chirps_mensal$id_celula)),
+  "\n"
+)
+
+cat(
+  "Valores ausentes na soma mensal:",
+  sum(is.na(chirps_mensal$prec_mensal_soma)),
+  "\n"
+)
+
+cat(
+  "Valores ausentes no máximo mensal:",
+  sum(is.na(chirps_mensal$prec_mensal_max)),
+  "\n\n"
+)
+
+
+# ============================================================
+# 7. VISUALIZAR PRIMEIRAS LINHAS
+# ============================================================
+
+print(
+  head(
+    chirps_mensal,
+    20
+  )
+)
+
+
+# ============================================================
+# 8. SALVAR BASE MENSAL
+# ============================================================
+
+write.csv(
+  chirps_mensal,
+  ARQUIVO_SAIDA,
+  row.names = FALSE
+)
+
+cat(
+  "\nArquivo mensal salvo em:\n",
+  ARQUIVO_SAIDA,
+  "\n"
+)
