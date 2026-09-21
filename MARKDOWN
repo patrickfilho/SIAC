@@ -148,21 +148,18 @@ localizar_arquivo <- function(opcoes) {
 
 ARQUIVO_BASE <- localizar_arquivo(
   c(
-    "5.1 base_tratada_v2.csv",
     "base_tratada_v2.csv"
   )
 )
 
 ARQUIVO_A <- localizar_arquivo(
   c(
-    "6.2 matriz_adjacencia_A.csv",
     "matriz_adjacencia_A.csv"
   )
 )
 
 ARQUIVO_YBAR <- localizar_arquivo(
   c(
-    "7.1 ybar_mensal.csv",
     "ybar_mensal.csv"
   )
 )
@@ -383,7 +380,7 @@ base <- base %>%
   left_join(
 
     ybar %>%
-      select(
+      dplyr::select(
         id_celula,
         ano,
         mes,
