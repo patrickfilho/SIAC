@@ -1,20 +1,15 @@
 
+
 processing file: 9.-Modelo-Espaço-Temporal.Rmd
   |......                                      |  14% [spatial-lag]            
 
-                                                                                                                    
 Error in `select()`:
-! argumentos não utilizados (id_celula, ano, mes, y_bar)
+! argumentos não utilizados (id_celula, y_bar)
 Backtrace:
     ▆
- 1. ├─base %>% ...
- 2. ├─dplyr::left_join(...)
- 3. ├─dplyr:::left_join.data.frame(...)
- 4. │ └─dplyr::auto_copy(x, y, copy = copy)
- 5. │   ├─dplyr::same_src(x, y)
- 6. │   └─dplyr:::same_src.data.frame(x, y)
- 7. │     └─base::is.data.frame(y)
- 8. └─ybar %>% select(id_celula, ano, mes, y_bar)
+ 1. └─global calcular_spatial_lag(dados = base, A = A, grid_order = grid_order)
+ 2.   └─dados %>% filter(data_mes == mes_anterior) %>% ...
+                                                                                                                    
 
 Quitting from 9.-Modelo-Espaço-Temporal.Rmd:373-525 [spatial-lag]
 Execução interrompida
