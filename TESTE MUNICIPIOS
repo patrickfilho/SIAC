@@ -18,13 +18,14 @@
 # ------------------------------------------------------------
 
 # Rode apenas uma vez, se ainda nao tiver os pacotes:
-# install.packages(c("sf", "dplyr", "readr", "ggplot2", "units"))
+# install.packages(c("geobr","sf", "dplyr", "readr", "ggplot2", "units"))
 
 library(sf)
 library(dplyr)
 library(readr)
 library(ggplot2)
 library(units)
+library(geobr)
 
 
 # ------------------------------------------------------------
@@ -34,13 +35,6 @@ library(units)
 # Ajuste para o local onde voce salvou os arquivos.
 
 arquivo_chirps <- "grade_CHIRPS_5x5.csv"
-
-# Exemplo caso tenha baixado o shapefile do IBGE:
-arquivo_municipios <- "RS_Municipios_2024.shp"
-
-# Se for GeoPackage, poderia ser:
-# arquivo_municipios <- "RS_Municipios_2024.gpkg"
-
 
 # ------------------------------------------------------------
 # 2. LER O CSV DOS CENTROIDES
@@ -70,9 +64,9 @@ print(
 # 3. LER MALHA MUNICIPAL DO IBGE
 # ------------------------------------------------------------
 
-municipios <- st_read(
-  arquivo_municipios,
-  quiet = TRUE
+municipios <- read_municipality(
+  code_muni = "RS",
+  year = 2020
 )
 
 # Ver nomes das colunas do arquivo do IBGE
