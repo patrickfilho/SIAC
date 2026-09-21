@@ -1,0 +1,1057 @@
+# ============================================================
+# PARTE 2 - ALOCACAO DOS DESASTRES DO ATLAS NAS GRADES CHIRPS
+#
+# Entradas:
+# 1. municipio_grade_percentual.csv
+# 2. CHIRPS_Taquari_5x5_mensal_2001_2025 (1).csv
+# 3. Atlas_Desastres_RS.xlsx
+#
+# Saidas:
+# - eventos_atlas_alocados_grade.csv
+# - desastre_grade_mes.csv
+#
+# Logica:
+#
+# Para cada desastre do Atlas:
+#   1. identificar o municipio
+#   2. identificar quais grades interceptam esse municipio
+#   3. calcular peso territorial da grade
+#   4. calcular score climatico da grade no mes do evento
+#   5. combinar peso territorial + chuva
+#   6. transformar em probabilidades
+#   7. sortear uma grade
+#   8. agregar os eventos por grade e mes
+#
+# O resultado final desastre_natural sera Y_{g,t}
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+# Rode uma vez, se necessario:
+#
+# install.packages(c(
+#   "dplyr",
+#   "readr",
+#   "readxl",
+#   "tidyr",
+#   "stringr"
+# ))
+
+library(dplyr)
+library(readr)
+library(readxl)
+library(tidyr)
+library(stringr)
+
+
+# ------------------------------------------------------------
+# 1. CAMINHOS DOS ARQUIVOS
+# ------------------------------------------------------------
+
+arquivo_municipio_grade <-
+  "municipio_grade_percentual.csv"
+
+arquivo_chirps_mensal <-
+  "CHIRPS_Taquari_5x5_mensal_2001_2025 (1).csv"
+
+arquivo_atlas <-
+  "Atlas_Desastres_RS.xlsx"
+
+
+# ------------------------------------------------------------
+# 2. LER BASE MUNICIPIO x GRADE
+# ------------------------------------------------------------
+
+municipio_grade <- read_csv(
+  arquivo_municipio_grade,
+  show_col_types = FALSE
+)
+
+cat(
+  "\nColunas de municipio_grade:\n"
+)
+
+print(
+  names(municipio_grade)
+)
+
+
+# ------------------------------------------------------------
+# 3. CRIAR PESO TERRITORIAL CONDICIONAL
+# ------------------------------------------------------------
+
+# area_intersec_km2 =
+# area do municipio que esta dentro daquela grade
+#
+# Para cada municipio, normalizamos a area entre todas as
+# grades que o interceptam.
+#
+# Assim:
+#
+# soma dos pesos de cada municipio = 1
+
+municipio_grade <- municipio_grade %>%
+
+  group_by(
+    codigo_municipio,
+    municipio
+  ) %>%
+
+  mutate(
+
+    peso_area_condicional =
+      area_intersec_km2 /
+      sum(
+        area_intersec_km2,
+        na.rm = TRUE
+      )
+
+  ) %>%
+
+  ungroup()
+
+
+# ------------------------------------------------------------
+# 4. CHECAR PESOS TERRITORIAIS
+# ------------------------------------------------------------
+
+checagem_area <- municipio_grade %>%
+
+  group_by(
+    codigo_municipio,
+    municipio
+  ) %>%
+
+  summarise(
+
+    soma_peso =
+      sum(
+        peso_area_condicional,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
+
+  )
+
+
+cat(
+  "\nChecagem dos pesos territoriais:\n"
+)
+
+print(
+  checagem_area,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 5. LER BASE CHIRPS MENSAL
+# ------------------------------------------------------------
+
+chirps <- read_csv(
+  arquivo_chirps_mensal,
+  show_col_types = FALSE
+)
+
+
+cat(
+  "\nColunas da base CHIRPS:\n"
+)
+
+print(
+  names(chirps)
+)
+
+
+cat(
+  "\nDimensao da base CHIRPS:\n"
+)
+
+print(
+  dim(chirps)
+)
+
+
+# ------------------------------------------------------------
+# 6. PREPARAR X1, X2 E X3
+# ------------------------------------------------------------
+
+# Base confirmada:
+#
+# X1 = prec_mensal_soma
+# X2 = prec_mensal_max
+# X3 = dias_acima_threshold
+#
+# ano e mes ja existem diretamente.
+
+chirps_modelo <- chirps %>%
+
+  transmute(
+
+    id_celula = id_celula,
+
+    ano = as.integer(ano),
+
+    mes = as.integer(mes),
+
+    X1_prec_mensal =
+      prec_mensal_soma,
+
+    X2_max_diaria =
+      prec_mensal_max,
+
+    X3_dias_extremos =
+      dias_acima_threshold
+
+  )
+
+
+# ------------------------------------------------------------
+# 7. PADRONIZAR X1, X2 E X3
+# ------------------------------------------------------------
+
+# Para dar pesos iguais, primeiro precisamos colocar as
+# variaveis na mesma escala.
+#
+# Z(X) = (X - media) / desvio-padrao
+
+chirps_modelo <- chirps_modelo %>%
+
+  mutate(
+
+    Z_X1 =
+      as.numeric(
+        scale(
+          X1_prec_mensal
+        )
+      ),
+
+    Z_X2 =
+      as.numeric(
+        scale(
+          X2_max_diaria
+        )
+      ),
+
+    Z_X3 =
+      as.numeric(
+        scale(
+          X3_dias_extremos
+        )
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 8. CRIAR SCORE CLIMATICO
+# ------------------------------------------------------------
+
+# Como decidimos dar peso igual:
+#
+# score_climatico =
+# Z(X1) + Z(X2) + Z(X3)
+
+chirps_modelo <- chirps_modelo %>%
+
+  mutate(
+
+    score_climatico =
+      Z_X1 +
+      Z_X2 +
+      Z_X3
+
+  )
+
+
+# ------------------------------------------------------------
+# 9. RESUMO DO SCORE
+# ------------------------------------------------------------
+
+cat(
+  "\nResumo do score climatico:\n"
+)
+
+print(
+  summary(
+    chirps_modelo$score_climatico
+  )
+)
+
+
+# ------------------------------------------------------------
+# 10. LER BASE DO ATLAS
+# ------------------------------------------------------------
+
+atlas <- read_excel(
+  arquivo_atlas,
+  sheet = "Base Eventos - RS"
+)
+
+
+cat(
+  "\nColunas da base Atlas:\n"
+)
+
+print(
+  names(atlas)
+)
+
+
+# ------------------------------------------------------------
+# 11. PREPARAR BASE DO ATLAS
+# ------------------------------------------------------------
+
+# O arquivo possui:
+#
+# Nome_Municipio
+# Cod_IBGE_Mun
+# Year
+# Month
+#
+# Como podem existir outras colunas interessantes,
+# mantemos apenas o necessario para esta etapa.
+
+atlas_modelo <- atlas %>%
+
+  transmute(
+
+    municipio_atlas =
+      Nome_Municipio,
+
+    codigo_municipio =
+      as.character(
+        Cod_IBGE_Mun
+      ),
+
+    ano =
+      as.integer(
+        Year
+      ),
+
+    mes =
+      as.integer(
+        Month
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 12. PADRONIZAR CODIGO MUNICIPAL NA BASE ESPACIAL
+# ------------------------------------------------------------
+
+municipio_grade <- municipio_grade %>%
+
+  mutate(
+
+    codigo_municipio =
+      as.character(
+        codigo_municipio
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 13. FILTRAR PERIODO 2001-2025
+# ------------------------------------------------------------
+
+atlas_modelo <- atlas_modelo %>%
+
+  filter(
+    ano >= 2001,
+    ano <= 2025
+  )
+
+
+# ------------------------------------------------------------
+# 14. FILTRAR SOMENTE MUNICIPIOS QUE INTERSECTAM AS GRADES
+# ------------------------------------------------------------
+
+atlas_footprint <- atlas_modelo %>%
+
+  semi_join(
+
+    municipio_grade %>%
+      distinct(
+        codigo_municipio
+      ),
+
+    by =
+      "codigo_municipio"
+
+  )
+
+
+cat(
+  "\nNumero de eventos do Atlas nos municipios selecionados:",
+  nrow(atlas_footprint),
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# 15. MOSTRAR EVENTOS POR MUNICIPIO
+# ------------------------------------------------------------
+
+eventos_por_municipio <- atlas_footprint %>%
+
+  count(
+    municipio_atlas,
+    sort = TRUE
+  )
+
+
+cat(
+  "\nEventos por municipio:\n"
+)
+
+print(
+  eventos_por_municipio,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 16. CRIAR IDENTIFICADOR UNICO PARA CADA EVENTO
+# ------------------------------------------------------------
+
+atlas_footprint <- atlas_footprint %>%
+
+  mutate(
+
+    id_evento =
+      row_number()
+
+  )
+
+
+# ------------------------------------------------------------
+# 17. EXPANDIR CADA EVENTO PARA TODAS AS GRADES
+#     QUE INTERCEPTAM SEU MUNICIPIO
+# ------------------------------------------------------------
+
+candidatos <- atlas_footprint %>%
+
+  left_join(
+
+    municipio_grade %>%
+
+      select(
+
+        codigo_municipio,
+
+        id_celula,
+
+        peso_area_condicional,
+
+        area_intersec_km2,
+
+        pct_municipio_na_grade
+
+      ),
+
+    by =
+      "codigo_municipio"
+
+  )
+
+
+# ------------------------------------------------------------
+# 18. ADICIONAR CHIRPS DO MES DO EVENTO
+# ------------------------------------------------------------
+
+candidatos <- candidatos %>%
+
+  left_join(
+
+    chirps_modelo %>%
+
+      select(
+
+        id_celula,
+
+        ano,
+
+        mes,
+
+        X1_prec_mensal,
+
+        X2_max_diaria,
+
+        X3_dias_extremos,
+
+        Z_X1,
+
+        Z_X2,
+
+        Z_X3,
+
+        score_climatico
+
+      ),
+
+    by = c(
+      "id_celula",
+      "ano",
+      "mes"
+    )
+
+  )
+
+
+# ------------------------------------------------------------
+# 19. CHECAR CHIRPS FALTANTE
+# ------------------------------------------------------------
+
+faltantes_chirps <- candidatos %>%
+
+  filter(
+    is.na(
+      score_climatico
+    )
+  )
+
+
+if (
+  nrow(
+    faltantes_chirps
+  ) > 0
+) {
+
+  cat(
+    "\nATENCAO:",
+    nrow(faltantes_chirps),
+    "combinacoes evento-grade sem CHIRPS.\n"
+  )
+
+  print(
+
+    faltantes_chirps %>%
+
+      select(
+
+        id_evento,
+
+        municipio_atlas,
+
+        ano,
+
+        mes,
+
+        id_celula
+
+      ),
+
+    n = Inf
+
+  )
+
+} else {
+
+  cat(
+    "\nOK: todas as combinacoes evento-grade encontraram CHIRPS.\n"
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 20. CALCULAR PESO CLIMATICO
+# ------------------------------------------------------------
+
+# score_climatico pode ser negativo.
+#
+# Para gerar um peso positivo utilizamos:
+#
+# peso_climatico =
+# exp(score_climatico)
+
+candidatos <- candidatos %>%
+
+  mutate(
+
+    peso_climatico =
+      exp(
+        score_climatico
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 21. COMBINAR AREA + CHUVA
+# ------------------------------------------------------------
+
+# Formula:
+#
+# peso_bruto =
+#
+# peso_area_condicional
+# *
+# peso_climatico
+
+candidatos <- candidatos %>%
+
+  mutate(
+
+    peso_bruto =
+      peso_area_condicional *
+      peso_climatico
+
+  )
+
+
+# ------------------------------------------------------------
+# 22. TRANSFORMAR EM PROBABILIDADE
+# ------------------------------------------------------------
+
+# Para cada evento:
+#
+# P(grid) =
+# peso_bruto(grid) /
+# soma peso_bruto(todas as grades candidatas)
+
+candidatos <- candidatos %>%
+
+  group_by(
+    id_evento
+  ) %>%
+
+  mutate(
+
+    prob_grade =
+      peso_bruto /
+      sum(
+        peso_bruto,
+        na.rm = TRUE
+      )
+
+  ) %>%
+
+  ungroup()
+
+
+# ------------------------------------------------------------
+# 23. CHECAR PROBABILIDADES
+# ------------------------------------------------------------
+
+checagem_probabilidades <- candidatos %>%
+
+  group_by(
+    id_evento
+  ) %>%
+
+  summarise(
+
+    soma_prob =
+      sum(
+        prob_grade,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
+
+  )
+
+
+cat(
+  "\nResumo da soma das probabilidades por evento:\n"
+)
+
+print(
+  summary(
+    checagem_probabilidades$soma_prob
+  )
+)
+
+
+# ------------------------------------------------------------
+# 24. CHECAR EVENTUAIS PROBLEMAS
+# ------------------------------------------------------------
+
+problemas_prob <- checagem_probabilidades %>%
+
+  filter(
+    abs(
+      soma_prob - 1
+    ) > 0.000001
+  )
+
+
+if (
+  nrow(
+    problemas_prob
+  ) == 0
+) {
+
+  cat(
+    "\nOK: todas as probabilidades somam 1.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: existem eventos cujas probabilidades nao somam 1.\n"
+  )
+
+  print(
+    problemas_prob
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 25. FIXAR SEED
+# ------------------------------------------------------------
+
+# Isso faz com que o sorteio seja reproduzivel.
+#
+# Se rodarmos novamente com a mesma seed,
+# teremos a mesma alocacao.
+
+set.seed(
+  12345
+)
+
+
+# ------------------------------------------------------------
+# 26. SORTEAR UMA GRADE PARA CADA EVENTO
+# ------------------------------------------------------------
+
+eventos_alocados <- candidatos %>%
+
+  group_by(
+    id_evento
+  ) %>%
+
+  slice_sample(
+
+    n = 1,
+
+    weight_by =
+      prob_grade
+
+  ) %>%
+
+  ungroup()
+
+
+# ------------------------------------------------------------
+# 27. RESULTADO DETALHADO DOS EVENTOS
+# ------------------------------------------------------------
+
+eventos_alocados_final <- eventos_alocados %>%
+
+  select(
+
+    id_evento,
+
+    municipio_atlas,
+
+    codigo_municipio,
+
+    ano,
+
+    mes,
+
+    id_celula,
+
+    peso_area_condicional,
+
+    X1_prec_mensal,
+
+    X2_max_diaria,
+
+    X3_dias_extremos,
+
+    Z_X1,
+
+    Z_X2,
+
+    Z_X3,
+
+    score_climatico,
+
+    peso_climatico,
+
+    peso_bruto,
+
+    prob_grade
+
+  )
+
+
+cat(
+  "\nEventos alocados:\n"
+)
+
+print(
+  eventos_alocados_final,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 28. AGREGAR PARA FORMAR Y_{g,t}
+# ------------------------------------------------------------
+
+# Se duas ocorrencias forem sorteadas para a mesma grade
+# no mesmo mes:
+#
+# desastre_natural = 2
+#
+# etc.
+
+desastre_grade_mes <- eventos_alocados_final %>%
+
+  count(
+
+    id_celula,
+
+    ano,
+
+    mes,
+
+    name =
+      "desastre_natural"
+
+  ) %>%
+
+  arrange(
+    ano,
+    mes,
+    id_celula
+  )
+
+
+# ------------------------------------------------------------
+# 29. CHECAGEM DO TOTAL DE EVENTOS
+# ------------------------------------------------------------
+
+total_atlas <-
+  nrow(
+    atlas_footprint
+  )
+
+
+total_alocado <-
+  sum(
+    desastre_grade_mes$desastre_natural
+  )
+
+
+cat(
+  "\n=============================================\n"
+)
+
+cat(
+  "TOTAL DE EVENTOS NO ATLAS:",
+  total_atlas,
+  "\n"
+)
+
+cat(
+  "TOTAL DE EVENTOS ALOCADOS:",
+  total_alocado,
+  "\n"
+)
+
+cat(
+  "=============================================\n"
+)
+
+
+if (
+  total_atlas ==
+  total_alocado
+) {
+
+  cat(
+    "\nOK: todos os eventos foram preservados.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: o total de eventos nao foi preservado.\n"
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 30. RESUMO POR ANO
+# ------------------------------------------------------------
+
+resumo_ano <- desastre_grade_mes %>%
+
+  group_by(
+    ano
+  ) %>%
+
+  summarise(
+
+    desastres =
+      sum(
+        desastre_natural
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\nDesastres por ano:\n"
+)
+
+print(
+  resumo_ano,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 31. RESUMO POR MES DO ANO
+# ------------------------------------------------------------
+
+resumo_mes <- desastre_grade_mes %>%
+
+  group_by(
+    mes
+  ) %>%
+
+  summarise(
+
+    desastres =
+      sum(
+        desastre_natural
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\nDesastres por mes do ano:\n"
+)
+
+print(
+  resumo_mes,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 32. RESUMO POR GRADE
+# ------------------------------------------------------------
+
+resumo_grade <- desastre_grade_mes %>%
+
+  group_by(
+    id_celula
+  ) %>%
+
+  summarise(
+
+    desastres =
+      sum(
+        desastre_natural
+      ),
+
+    .groups =
+      "drop"
+
+  ) %>%
+
+  arrange(
+    desc(
+      desastres
+    )
+  )
+
+
+cat(
+  "\nDesastres por grade:\n"
+)
+
+print(
+  resumo_grade,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 33. EXPORTAR
+# ------------------------------------------------------------
+
+write_csv(
+
+  eventos_alocados_final,
+
+  "eventos_atlas_alocados_grade.csv"
+
+)
+
+
+write_csv(
+
+  desastre_grade_mes,
+
+  "desastre_grade_mes.csv"
+
+)
+
+
+write_csv(
+
+  resumo_ano,
+
+  "resumo_desastres_ano.csv"
+
+)
+
+
+write_csv(
+
+  resumo_mes,
+
+  "resumo_desastres_mes.csv"
+
+)
+
+
+write_csv(
+
+  resumo_grade,
+
+  "resumo_desastres_grade.csv"
+
+)
+
+
+cat(
+  "\nArquivos salvos:\n",
+  "- eventos_atlas_alocados_grade.csv\n",
+  "- desastre_grade_mes.csv\n",
+  "- resumo_desastres_ano.csv\n",
+  "- resumo_desastres_mes.csv\n",
+  "- resumo_desastres_grade.csv\n"
+)
+
+
+cat(
+  "\nDiretorio:\n",
+  getwd(),
+  "\n"
+)
