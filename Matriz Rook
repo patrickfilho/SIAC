@@ -1,0 +1,604 @@
+# ============================================================
+# PARTE 4 - MATRIZ DE ADJACENCIA ESPACIAL A
+# Tipo: Rook adjacency
+#
+# Entrada:
+# base_tratada_v2.csv
+#
+# Saidas:
+# - matriz_adjacencia_A.csv
+# - lista_vizinhos_rook.csv
+#
+# Logica:
+#
+# A_ij = 1 se as celulas i e j compartilham uma aresta
+# A_ij = 0 caso contrario
+#
+# Nao consideramos diagonais.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+library(dplyr)
+library(readr)
+library(tidyr)
+
+
+# ------------------------------------------------------------
+# 1. LER BASE V2
+# ------------------------------------------------------------
+
+base <- read_csv(
+  "base_tratada_v2.csv",
+  show_col_types = FALSE
+)
+
+
+cat(
+  "\nColunas da base:\n"
+)
+
+print(
+  names(base)
+)
+
+
+# ------------------------------------------------------------
+# 2. EXTRAIR UMA LINHA POR CELULA
+# ------------------------------------------------------------
+
+# Precisamos apenas da estrutura espacial:
+#
+# id_celula
+# linha
+# coluna
+
+celulas <- base %>%
+
+  distinct(
+    id_celula,
+    linha,
+    coluna
+  ) %>%
+
+  arrange(
+    linha,
+    coluna
+  )
+
+
+cat(
+  "\nNumero de celulas encontradas:\n"
+)
+
+print(
+  nrow(celulas)
+)
+
+
+if (
+  nrow(celulas) != 25
+) {
+
+  warning(
+    "Foram encontradas ",
+    nrow(celulas),
+    " celulas, mas esperavamos 25."
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 3. CHECAR DUPLICIDADE
+# ------------------------------------------------------------
+
+duplicadas <- celulas %>%
+
+  count(
+    linha,
+    coluna
+  ) %>%
+
+  filter(
+    n > 1
+  )
+
+
+if (
+  nrow(duplicadas) == 0
+) {
+
+  cat(
+    "\nOK: nao existem celulas duplicadas em linha/coluna.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: existem posicoes duplicadas.\n"
+  )
+
+  print(
+    duplicadas
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 4. CRIAR TODAS AS COMBINACOES DE CELULAS
+# ------------------------------------------------------------
+
+pares <- expand_grid(
+
+  i = seq_len(
+    nrow(celulas)
+  ),
+
+  j = seq_len(
+    nrow(celulas)
+  )
+
+)
+
+
+# ------------------------------------------------------------
+# 5. ADICIONAR INFORMACOES DAS CELULAS I E J
+# ------------------------------------------------------------
+
+pares <- pares %>%
+
+  mutate(
+
+    id_i =
+      celulas$id_celula[i],
+
+    linha_i =
+      celulas$linha[i],
+
+    coluna_i =
+      celulas$coluna[i],
+
+    id_j =
+      celulas$id_celula[j],
+
+    linha_j =
+      celulas$linha[j],
+
+    coluna_j =
+      celulas$coluna[j]
+
+  )
+
+
+# ------------------------------------------------------------
+# 6. DEFINIR ROOK ADJACENCY
+# ------------------------------------------------------------
+
+# Duas celulas sao rook-vizinhas quando:
+#
+# abs(linha_i - linha_j)
+# +
+# abs(coluna_i - coluna_j)
+# ==
+# 1
+
+pares <- pares %>%
+
+  mutate(
+
+    rook =
+      if_else(
+
+        abs(
+          linha_i - linha_j
+        ) +
+
+        abs(
+          coluna_i - coluna_j
+        )
+
+        == 1,
+
+        1L,
+
+        0L
+
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 7. GARANTIR DIAGONAL ZERO
+# ------------------------------------------------------------
+
+# A_ii deve ser zero.
+
+pares <- pares %>%
+
+  mutate(
+
+    rook =
+      if_else(
+        i == j,
+        0L,
+        rook
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 8. CONSTRUIR MATRIZ A
+# ------------------------------------------------------------
+
+A <- matrix(
+
+  pares$rook,
+
+  nrow =
+    nrow(celulas),
+
+  ncol =
+    nrow(celulas),
+
+  byrow =
+    TRUE
+
+)
+
+
+# ------------------------------------------------------------
+# 9. ADICIONAR NOMES DE LINHAS E COLUNAS
+# ------------------------------------------------------------
+
+rownames(A) <-
+  celulas$id_celula
+
+colnames(A) <-
+  celulas$id_celula
+
+
+# ------------------------------------------------------------
+# 10. VISUALIZAR MATRIZ
+# ------------------------------------------------------------
+
+cat(
+  "\nMatriz de adjacencia A:\n"
+)
+
+print(
+  A
+)
+
+
+# ------------------------------------------------------------
+# 11. CHECAGEM 1:
+#     MATRIZ DEVE SER SIMETRICA
+# ------------------------------------------------------------
+
+if (
+  isTRUE(
+    all.equal(
+      A,
+      t(A)
+    )
+  )
+) {
+
+  cat(
+    "\nOK: A e simetrica.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: A nao e simetrica.\n"
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 12. CHECAGEM 2:
+#     DIAGONAL DEVE SER ZERO
+# ------------------------------------------------------------
+
+if (
+  all(
+    diag(A) == 0
+  )
+) {
+
+  cat(
+    "\nOK: diagonal de A e zero.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: existem valores diferentes de zero na diagonal.\n"
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 13. NUMERO DE VIZINHOS POR CELULA
+# ------------------------------------------------------------
+
+numero_vizinhos <-
+  rowSums(A)
+
+
+resumo_vizinhos <- tibble(
+
+  id_celula =
+    rownames(A),
+
+  numero_vizinhos =
+    numero_vizinhos
+
+) %>%
+
+  left_join(
+
+    celulas,
+
+    by =
+      "id_celula"
+
+  )
+
+
+cat(
+  "\nNumero de vizinhos por celula:\n"
+)
+
+print(
+  resumo_vizinhos,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 14. CHECAGEM ESPERADA PARA GRADE 5x5
+# ------------------------------------------------------------
+
+# Em uma grade 5x5 rook:
+#
+# 4 cantos -> 2 vizinhos
+# 12 bordas nao-canto -> 3 vizinhos
+# 9 interiores -> 4 vizinhos
+
+distribuicao_vizinhos <- resumo_vizinhos %>%
+
+  count(
+    numero_vizinhos
+  ) %>%
+
+  arrange(
+    numero_vizinhos
+  )
+
+
+cat(
+  "\nDistribuicao esperada de vizinhos:\n"
+)
+
+print(
+  distribuicao_vizinhos
+)
+
+
+# ------------------------------------------------------------
+# 15. VALIDAR ESTRUTURA 5x5
+# ------------------------------------------------------------
+
+esperado <- tibble(
+
+  numero_vizinhos =
+    c(
+      2,
+      3,
+      4
+    ),
+
+  n_esperado =
+    c(
+      4,
+      12,
+      9
+    )
+
+)
+
+
+validacao_grade <- distribuicao_vizinhos %>%
+
+  rename(
+    n_observado = n
+  ) %>%
+
+  full_join(
+
+    esperado,
+
+    by =
+      "numero_vizinhos"
+
+  )
+
+
+cat(
+  "\nValidacao da estrutura rook 5x5:\n"
+)
+
+print(
+  validacao_grade
+)
+
+
+# ------------------------------------------------------------
+# 16. CRIAR LISTA DE VIZINHOS
+# ------------------------------------------------------------
+
+lista_vizinhos <- pares %>%
+
+  filter(
+    rook == 1
+  ) %>%
+
+  select(
+
+    id_celula =
+      id_i,
+
+    vizinho =
+      id_j,
+
+    linha =
+      linha_i,
+
+    coluna =
+      coluna_i,
+
+    linha_vizinho =
+      linha_j,
+
+    coluna_vizinho =
+      coluna_j
+
+  ) %>%
+
+  arrange(
+    id_celula,
+    vizinho
+  )
+
+
+cat(
+  "\nLista de vizinhos:\n"
+)
+
+print(
+  lista_vizinhos,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 17. PREPARAR MATRIZ PARA CSV
+# ------------------------------------------------------------
+
+# write_csv nao salva rownames.
+#
+# Entao vamos transformar os nomes das linhas
+# em uma coluna explicita.
+
+A_csv <- as.data.frame(
+  A
+)
+
+A_csv <- tibble::rownames_to_column(
+
+  A_csv,
+
+  var =
+    "id_celula"
+
+)
+
+
+# ------------------------------------------------------------
+# 18. SALVAR MATRIZ A
+# ------------------------------------------------------------
+
+write_csv(
+
+  A_csv,
+
+  "matriz_adjacencia_A.csv"
+
+)
+
+
+# ------------------------------------------------------------
+# 19. SALVAR LISTA DE VIZINHOS
+# ------------------------------------------------------------
+
+write_csv(
+
+  lista_vizinhos,
+
+  "lista_vizinhos_rook.csv"
+
+)
+
+
+# ------------------------------------------------------------
+# 20. SALVAR RESUMO DE VIZINHOS
+# ------------------------------------------------------------
+
+write_csv(
+
+  resumo_vizinhos,
+
+  "resumo_vizinhos_rook.csv"
+
+)
+
+
+# ------------------------------------------------------------
+# 21. RESUMO FINAL
+# ------------------------------------------------------------
+
+cat(
+  "\n=============================================\n"
+)
+
+cat(
+  "MATRIZ ROOK CRIADA COM SUCESSO\n"
+)
+
+cat(
+  "\nDimensao de A:",
+  nrow(A),
+  "x",
+  ncol(A),
+  "\n"
+)
+
+cat(
+  "Numero total de ligacoes direcionais:",
+  sum(A),
+  "\n"
+)
+
+cat(
+  "Numero de pares de vizinhos:",
+  sum(A) / 2,
+  "\n"
+)
+
+cat(
+  "\nArquivos salvos:\n",
+  "- matriz_adjacencia_A.csv\n",
+  "- lista_vizinhos_rook.csv\n",
+  "- resumo_vizinhos_rook.csv\n"
+)
+
+cat(
+  "\nDiretorio:\n",
+  getwd(),
+  "\n"
+)
+
+cat(
+  "=============================================\n"
+)
