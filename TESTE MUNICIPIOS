@@ -1,0 +1,551 @@
+# ============================================================
+# INTERSECAO ENTRE GRADES CHIRPS E MUNICIPIOS DO RS
+# Objetivo:
+#   - construir os 25 polígonos a partir dos centroides
+#   - cruzar com a malha municipal do IBGE
+#   - calcular % de cada celula CHIRPS dentro de cada municipio
+#
+# CSV esperado:
+# grade_CHIRPS_5x5.csv
+#
+# Colunas do CSV:
+# coluna, linha, lon, lat, id_celula, central, id
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+# Rode apenas uma vez, se ainda nao tiver os pacotes:
+# install.packages(c("sf", "dplyr", "readr", "ggplot2", "units"))
+
+library(sf)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(units)
+
+
+# ------------------------------------------------------------
+# 1. CAMINHOS DOS ARQUIVOS
+# ------------------------------------------------------------
+
+# Ajuste para o local onde voce salvou os arquivos.
+
+arquivo_chirps <- "grade_CHIRPS_5x5.csv"
+
+# Exemplo caso tenha baixado o shapefile do IBGE:
+arquivo_municipios <- "RS_Municipios_2024.shp"
+
+# Se for GeoPackage, poderia ser:
+# arquivo_municipios <- "RS_Municipios_2024.gpkg"
+
+
+# ------------------------------------------------------------
+# 2. LER O CSV DOS CENTROIDES
+# ------------------------------------------------------------
+
+chirps <- read_csv(
+  arquivo_chirps,
+  show_col_types = FALSE
+)
+
+print(chirps)
+
+# Conferir estrutura
+str(chirps)
+
+# Conferir se temos exatamente 25 celulas
+stopifnot(nrow(chirps) == 25)
+
+# Conferir a celula central
+print(
+  chirps %>%
+    filter(central == TRUE)
+)
+
+
+# ------------------------------------------------------------
+# 3. LER MALHA MUNICIPAL DO IBGE
+# ------------------------------------------------------------
+
+municipios <- st_read(
+  arquivo_municipios,
+  quiet = TRUE
+)
+
+# Ver nomes das colunas do arquivo do IBGE
+print(names(municipios))
+
+# Ver sistema de coordenadas
+print(st_crs(municipios))
+
+
+# ------------------------------------------------------------
+# 4. PADRONIZAR COLUNAS MUNICIPAIS
+# ------------------------------------------------------------
+
+# Nas malhas recentes do IBGE, normalmente aparecem:
+# CD_MUN = codigo do municipio
+# NM_MUN = nome do municipio
+#
+# O script para caso a nomenclatura seja essa.
+
+if (!all(c("CD_MUN", "NM_MUN") %in% names(municipios))) {
+  stop(
+    paste0(
+      "Nao encontrei as colunas CD_MUN e NM_MUN no shapefile.\n",
+      "Execute names(municipios) e verifique como o IBGE nomeou ",
+      "codigo e nome do municipio."
+    )
+  )
+}
+
+municipios <- municipios %>%
+  select(
+    codigo_municipio = CD_MUN,
+    municipio = NM_MUN,
+    geometry
+  )
+
+
+# ------------------------------------------------------------
+# 5. GARANTIR CRS GEOGRAFICO COMPATIVEL
+# ------------------------------------------------------------
+
+# Os centroides CHIRPS estao em longitude / latitude WGS84,
+# portanto EPSG:4326.
+
+# Vamos transformar inicialmente a malha do IBGE para WGS84.
+municipios_wgs84 <- st_transform(
+  municipios,
+  crs = 4326
+)
+
+
+# ------------------------------------------------------------
+# 6. CONSTRUIR OS POLIGONOS DAS 25 CELULAS
+# ------------------------------------------------------------
+
+# CHIRPS possui resolucao de aproximadamente 0.05 grau.
+#
+# Como lon/lat representam o centro da celula:
+#
+# longitude minima = lon - 0.025
+# longitude maxima = lon + 0.025
+#
+# latitude minima  = lat - 0.025
+# latitude maxima  = lat + 0.025
+
+half_res <- 0.025
+
+
+criar_celula <- function(lon, lat, half_size = 0.025) {
+
+  coords <- matrix(
+    c(
+      lon - half_size, lat - half_size,
+      lon + half_size, lat - half_size,
+      lon + half_size, lat + half_size,
+      lon - half_size, lat + half_size,
+      lon - half_size, lat - half_size
+    ),
+    ncol = 2,
+    byrow = TRUE
+  )
+
+  st_polygon(
+    list(coords)
+  )
+}
+
+
+# Criar uma geometria para cada linha do CSV
+lista_geometrias <- lapply(
+  seq_len(nrow(chirps)),
+  function(i) {
+
+    criar_celula(
+      lon = chirps$lon[i],
+      lat = chirps$lat[i],
+      half_size = half_res
+    )
+
+  }
+)
+
+
+# Criar objeto sf
+grades <- st_sf(
+  chirps,
+  geometry = st_sfc(
+    lista_geometrias,
+    crs = 4326
+  )
+)
+
+
+# Visualizar
+print(grades)
+
+
+# ------------------------------------------------------------
+# 7. VERIFICAR SE AS CELULAS NAO SE SOBREPOEM
+# ------------------------------------------------------------
+
+# Como estamos usando uma grade regular, as celulas devem apenas
+# compartilhar suas bordas.
+
+plot(
+  st_geometry(grades),
+  main = "25 celulas CHIRPS"
+)
+
+
+# ------------------------------------------------------------
+# 8. REPROJETAR PARA SISTEMA METRICO
+# ------------------------------------------------------------
+
+# A regiao de Taquari/RS esta na zona UTM 22S.
+#
+# EPSG 31982 =
+# SIRGAS 2000 / UTM zone 22S
+#
+# Isso permite calcular areas em metros quadrados corretamente.
+
+epsg_utm <- 31982
+
+grades_utm <- st_transform(
+  grades,
+  crs = epsg_utm
+)
+
+municipios_utm <- st_transform(
+  municipios_wgs84,
+  crs = epsg_utm
+)
+
+
+# ------------------------------------------------------------
+# 9. SELECIONAR SOMENTE MUNICIPIOS PROXIMOS
+# ------------------------------------------------------------
+
+# Isso nao e estritamente necessario, mas acelera a intersecao.
+#
+# Primeiro criamos um unico poligono representando toda a area
+# coberta pelos 25 grids.
+
+area_total_grades <- grades_utm %>%
+  summarise()
+
+
+# Descobrir quais municipios tocam a area das grades
+
+idx_municipios <- st_intersects(
+  municipios_utm,
+  area_total_grades,
+  sparse = FALSE
+)[, 1]
+
+
+municipios_area <- municipios_utm[
+  idx_municipios,
+]
+
+
+cat(
+  "\nNumero de municipios que intersectam a area total:",
+  nrow(municipios_area),
+  "\n\n"
+)
+
+print(
+  municipios_area %>%
+    st_drop_geometry() %>%
+    arrange(municipio)
+)
+
+
+# ------------------------------------------------------------
+# 10. CALCULAR AREA TOTAL DE CADA GRID
+# ------------------------------------------------------------
+
+areas_grid <- grades_utm %>%
+  mutate(
+    area_grid_m2 = st_area(geometry)
+  ) %>%
+  mutate(
+    area_grid_km2 =
+      as.numeric(
+        set_units(area_grid_m2, km^2)
+      )
+  ) %>%
+  st_drop_geometry() %>%
+  select(
+    id,
+    id_celula,
+    area_grid_m2,
+    area_grid_km2
+  )
+
+
+print(areas_grid)
+
+
+# ------------------------------------------------------------
+# 11. INTERSECAO GRID x MUNICIPIO
+# ------------------------------------------------------------
+
+# st_intersection vai quebrar cada grid nos pedacos
+# pertencentes a cada municipio.
+
+intersecoes <- st_intersection(
+  grades_utm,
+  municipios_area
+)
+
+
+# ------------------------------------------------------------
+# 12. CALCULAR AREA DE CADA INTERSECAO
+# ------------------------------------------------------------
+
+intersecoes <- intersecoes %>%
+  mutate(
+    area_intersec_m2 = st_area(geometry),
+    area_intersec_km2 =
+      as.numeric(
+        set_units(area_intersec_m2, km^2)
+      )
+  )
+
+
+# ------------------------------------------------------------
+# 13. JUNTAR AREA TOTAL DO GRID
+# ------------------------------------------------------------
+
+resultado <- intersecoes %>%
+  left_join(
+    areas_grid,
+    by = c(
+      "id",
+      "id_celula"
+    )
+  )
+
+
+# ------------------------------------------------------------
+# 14. CALCULAR % DE CADA GRID EM CADA MUNICIPIO
+# ------------------------------------------------------------
+
+resultado <- resultado %>%
+  mutate(
+
+    pct_grid_no_municipio =
+      100 *
+      as.numeric(area_intersec_m2) /
+      as.numeric(area_grid_m2)
+
+  )
+
+
+# ------------------------------------------------------------
+# 15. TABELA FINAL
+# ------------------------------------------------------------
+
+tabela_final <- resultado %>%
+  st_drop_geometry() %>%
+  select(
+    id,
+    id_celula,
+    linha,
+    coluna,
+    lon,
+    lat,
+    central,
+    codigo_municipio,
+    municipio,
+    area_grid_km2,
+    area_intersec_km2,
+    pct_grid_no_municipio
+  ) %>%
+  arrange(
+    id,
+    desc(pct_grid_no_municipio)
+  )
+
+
+print(
+  tabela_final,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 16. VERIFICACAO:
+#     OS PERCENTUAIS DE CADA GRID DEVEM SOMAR ~100%
+# ------------------------------------------------------------
+
+checagem <- tabela_final %>%
+  group_by(
+    id,
+    id_celula
+  ) %>%
+  summarise(
+    soma_pct = sum(
+      pct_grid_no_municipio,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+
+print(checagem)
+
+
+# Identificar eventual problema
+
+problemas <- checagem %>%
+  filter(
+    abs(soma_pct - 100) > 0.1
+  )
+
+
+if (nrow(problemas) == 0) {
+
+  cat(
+    "\nOK: todos os grids somam aproximadamente 100%.\n"
+  )
+
+} else {
+
+  cat(
+    "\nATENCAO: existem grids cuja soma difere de 100%.\n"
+  )
+
+  print(problemas)
+
+}
+
+
+# ------------------------------------------------------------
+# 17. MUNICIPIO PREDOMINANTE DE CADA GRID
+# ------------------------------------------------------------
+
+municipio_principal <- tabela_final %>%
+  group_by(
+    id,
+    id_celula
+  ) %>%
+  slice_max(
+    order_by = pct_grid_no_municipio,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+
+cat(
+  "\nMunicipio predominante de cada celula:\n"
+)
+
+print(
+  municipio_principal %>%
+    select(
+      id,
+      id_celula,
+      municipio,
+      pct_grid_no_municipio
+    ),
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 18. LISTA UNICA DE MUNICIPIOS INTERSECTADOS
+# ------------------------------------------------------------
+
+municipios_intersectados <- tabela_final %>%
+  distinct(
+    codigo_municipio,
+    municipio
+  ) %>%
+  arrange(
+    municipio
+  )
+
+
+cat(
+  "\nMunicipios interceptados pelas 25 celulas:\n"
+)
+
+print(
+  municipios_intersectados,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 19. MAPA PARA CONFERENCIA VISUAL
+# ------------------------------------------------------------
+
+ggplot() +
+
+  geom_sf(
+    data = municipios_area,
+    fill = "grey95",
+    color = "grey40",
+    linewidth = 0.5
+  ) +
+
+  geom_sf(
+    data = grades_utm,
+    fill = NA,
+    color = "red",
+    linewidth = 0.8
+  ) +
+
+  geom_sf_text(
+    data = grades_utm,
+    aes(
+      label = id_celula
+    ),
+    size = 3
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title =
+      "Grades CHIRPS e municipios do RS",
+    subtitle =
+      "Cada quadrado representa uma celula 0.05 x 0.05 graus"
+  )
+
+
+# ------------------------------------------------------------
+# 20. EXPORTAR RESULTADOS
+# ------------------------------------------------------------
+
+write_csv(
+  tabela_final,
+  "grid_municipio_percentual.csv"
+)
+
+write_csv(
+  municipio_principal,
+  "grid_municipio_principal.csv"
+)
+
+write_csv(
+  municipios_intersectados,
+  "municipios_intersectados.csv"
+)
+
+
+cat(
+  "\nArquivos criados:\n",
+  "- grid_municipio_percentual.csv\n",
+  "- grid_municipio_principal.csv\n",
+  "- municipios_intersectados.csv\n"
+)
