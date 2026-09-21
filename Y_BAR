@@ -1,0 +1,315 @@
+# ============================================================
+# PARTE 5 - CONSTRUCAO DE Y_BAR
+#
+# Entrada:
+# base_tratada_v2.csv
+#
+# Saida:
+# ybar_mensal.csv
+#
+# Definicao:
+#
+# Y_bar(g,t) = 1 se Y(g,t) exceder o quantil 80%
+# de uma Poisson de referencia
+#
+# Y_bar(g,t) = 0 caso contrario
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+library(dplyr)
+library(readr)
+
+
+# ------------------------------------------------------------
+# 1. LER BASE V2
+# ------------------------------------------------------------
+
+base <- read_csv(
+  "base_tratada_v2.csv",
+  show_col_types = FALSE
+)
+
+
+# ------------------------------------------------------------
+# 2. CHECAR COLUNAS NECESSARIAS
+# ------------------------------------------------------------
+
+colunas_necessarias <- c(
+  "id_celula",
+  "ano",
+  "mes",
+  "exposicao",
+  "desastre_natural"
+)
+
+faltantes <- setdiff(
+  colunas_necessarias,
+  names(base)
+)
+
+if (length(faltantes) > 0) {
+  stop(
+    paste(
+      "Colunas faltantes:",
+      paste(faltantes, collapse = ", ")
+    )
+  )
+}
+
+
+# ------------------------------------------------------------
+# 3. CALCULAR FREQUENCIA GLOBAL
+# ------------------------------------------------------------
+
+lambda_global <-
+  sum(
+    base$desastre_natural,
+    na.rm = TRUE
+  ) /
+  sum(
+    base$exposicao,
+    na.rm = TRUE
+  )
+
+
+cat(
+  "\nLambda global =",
+  lambda_global,
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# 4. CALCULAR MEDIA POISSON DE REFERENCIA
+# ------------------------------------------------------------
+
+base_ybar <- base %>%
+
+  mutate(
+
+    lambda_ref =
+      lambda_global *
+      exposicao
+
+  )
+
+
+# ------------------------------------------------------------
+# 5. CALCULAR THRESHOLD POISSON
+# ------------------------------------------------------------
+
+# Quantil de 80%, como no artigo
+
+base_ybar <- base_ybar %>%
+
+  mutate(
+
+    threshold_ybar =
+      qpois(
+        0.80,
+        lambda =
+          lambda_ref
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 6. CONSTRUIR Y_BAR
+# ------------------------------------------------------------
+
+base_ybar <- base_ybar %>%
+
+  mutate(
+
+    y_bar =
+      if_else(
+        desastre_natural >
+          threshold_ybar,
+        1L,
+        0L
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# 7. TABELA FINAL
+# ------------------------------------------------------------
+
+ybar_mensal <- base_ybar %>%
+
+  select(
+    id_celula,
+    ano,
+    mes,
+    desastre_natural,
+    exposicao,
+    lambda_ref,
+    threshold_ybar,
+    y_bar
+  ) %>%
+
+  arrange(
+    ano,
+    mes,
+    id_celula
+  )
+
+
+# ------------------------------------------------------------
+# 8. RESUMO DOS THRESHOLDS
+# ------------------------------------------------------------
+
+cat(
+  "\nDistribuicao do threshold_ybar:\n"
+)
+
+print(
+  table(
+    ybar_mensal$threshold_ybar
+  )
+)
+
+
+# ------------------------------------------------------------
+# 9. RESUMO DE Y_BAR
+# ------------------------------------------------------------
+
+cat(
+  "\nDistribuicao de y_bar:\n"
+)
+
+print(
+  table(
+    ybar_mensal$y_bar
+  )
+)
+
+
+# ------------------------------------------------------------
+# 10. CHECAR RELACAO ENTRE Y E Y_BAR
+# ------------------------------------------------------------
+
+cat(
+  "\nTabela Y x Y_bar:\n"
+)
+
+print(
+  table(
+    ybar_mensal$desastre_natural,
+    ybar_mensal$y_bar
+  )
+)
+
+
+# ------------------------------------------------------------
+# 11. VER QUANTOS SHOCKS POR GRID
+# ------------------------------------------------------------
+
+shocks_por_grid <- ybar_mensal %>%
+
+  group_by(
+    id_celula
+  ) %>%
+
+  summarise(
+
+    n_shocks =
+      sum(
+        y_bar,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+
+  ) %>%
+
+  arrange(
+    desc(
+      n_shocks
+    )
+  )
+
+
+cat(
+  "\nNumero de shocks por grid:\n"
+)
+
+print(
+  shocks_por_grid,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 12. VER QUANTOS SHOCKS POR ANO
+# ------------------------------------------------------------
+
+shocks_por_ano <- ybar_mensal %>%
+
+  group_by(
+    ano
+  ) %>%
+
+  summarise(
+
+    n_shocks =
+      sum(
+        y_bar,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\nNumero de shocks por ano:\n"
+)
+
+print(
+  shocks_por_ano,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 13. SALVAR
+# ------------------------------------------------------------
+
+write_csv(
+  ybar_mensal,
+  "ybar_mensal.csv"
+)
+
+write_csv(
+  shocks_por_grid,
+  "resumo_shocks_por_grid.csv"
+)
+
+write_csv(
+  shocks_por_ano,
+  "resumo_shocks_por_ano.csv"
+)
+
+
+cat(
+  "\nArquivos salvos:\n",
+  "- ybar_mensal.csv\n",
+  "- resumo_shocks_por_grid.csv\n",
+  "- resumo_shocks_por_ano.csv\n"
+)
+
+cat(
+  "\nDiretorio:\n",
+  getwd(),
+  "\n"
+)
