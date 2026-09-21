@@ -1,0 +1,3255 @@
+---
+title: "Modelo Espaço-Temporal Negative Binomial (SP-NB)"
+subtitle: "Aplicação a desastres naturais e precipitação CHIRPS"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+date: "`r Sys.Date()`"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# 0. CONFIGURACOES GERAIS
+# ============================================================
+
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+
+# ------------------------------------------------------------
+# Pacotes
+# ------------------------------------------------------------
+
+pacotes <- c(
+  "dplyr",
+  "tidyr",
+  "readr",
+  "ggplot2",
+  "MASS",
+  "knitr",
+  "scales"
+)
+
+instalar <- pacotes[
+  !pacotes %in% rownames(installed.packages())
+]
+
+if (length(instalar) > 0) {
+  install.packages(instalar)
+}
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(MASS)
+library(knitr)
+library(scales)
+
+# ------------------------------------------------------------
+# Configuracoes do modelo
+# ------------------------------------------------------------
+
+# Corte temporal para avaliacao fora da amostra.
+# Treino: 2001-2020
+# Teste:  2021-2025
+
+TRAIN_END_YEAR <- 2020
+
+# Algoritmo EM
+MAX_ITER_EM <- 300
+TOL_EM <- 1e-6
+
+# Calcular erros-padrao via Hessiana numerica.
+# Pode demorar um pouco principalmente no modelo com 25 psi.
+CALCULAR_SE <- TRUE
+
+# Pequeno valor numerico
+EPS <- 1e-12
+```
+
+# 1. Objetivo
+
+O modelo principal é o **Spatio-Temporal Negative Binomial (SP-NB)** utilizado no artigo *SpaceTime*.
+
+Para cada grade \(g\) e mês \(t\):
+
+\[
+Y_{g,t} \sim NB(\lambda_{g,t},\phi)
+\]
+
+com:
+
+\[
+\lambda_{g,t}
+=
+E_{g,t}
+\left[
+\exp(\beta^T X_{g,t})
++
+\psi_g (A\bar{Y}_{t-1})_g
+\right].
+\]
+
+Onde:
+
+- \(Y_{g,t}\): número de desastres naturais;
+- \(E_{g,t}\): exposição temporal;
+- \(X_{g,t}\): covariáveis de precipitação;
+- \(A\): matriz de adjacência espacial Rook;
+- \(\bar{Y}_{g,t}\): indicador de shock;
+- \((A\bar Y_{t-1})_g\): número de vizinhos que tiveram shock no mês anterior;
+- \(\psi_g\): sensibilidade espaço-temporal da grade;
+- \(\phi\): parâmetro de dispersão da Negative Binomial.
+
+Serão estimadas três especificações:
+
+1. **NB:** sem componente espaço-temporal;
+2. **SP-NB Global:** um único \(\psi\) para todas as grades;
+3. **SP-NB Grid:** um \(\psi_g\) específico para cada grade.
+
+# 2. Arquivos de entrada
+
+```{r arquivos}
+# ============================================================
+# 2. ARQUIVOS
+# ============================================================
+
+# Funcao para procurar automaticamente nomes alternativos
+
+localizar_arquivo <- function(opcoes) {
+
+  encontrados <- opcoes[file.exists(opcoes)]
+
+  if (length(encontrados) == 0) {
+    stop(
+      paste(
+        "Nenhum dos seguintes arquivos foi encontrado:",
+        paste(opcoes, collapse = ", ")
+      )
+    )
+  }
+
+  encontrados[1]
+}
+
+
+ARQUIVO_BASE <- localizar_arquivo(
+  c(
+    "5.1 base_tratada_v2.csv",
+    "base_tratada_v2.csv"
+  )
+)
+
+ARQUIVO_A <- localizar_arquivo(
+  c(
+    "6.2 matriz_adjacencia_A.csv",
+    "matriz_adjacencia_A.csv"
+  )
+)
+
+ARQUIVO_YBAR <- localizar_arquivo(
+  c(
+    "7.1 ybar_mensal.csv",
+    "ybar_mensal.csv"
+  )
+)
+
+
+cat("Base:", ARQUIVO_BASE, "\n")
+cat("Matriz A:", ARQUIVO_A, "\n")
+cat("Y_bar:", ARQUIVO_YBAR, "\n")
+```
+
+# 3. Leitura e validação dos dados
+
+```{r leitura}
+# ============================================================
+# 3. LEITURA DA BASE PRINCIPAL
+# ============================================================
+
+base <- read_csv(
+  ARQUIVO_BASE,
+  show_col_types = FALSE
+)
+
+ybar <- read_csv(
+  ARQUIVO_YBAR,
+  show_col_types = FALSE
+)
+
+# Matriz A:
+# read.csv usado para preservar exatamente os nomes das colunas
+
+A_df <- read.csv(
+  ARQUIVO_A,
+  check.names = FALSE
+)
+
+
+# ------------------------------------------------------------
+# Validacao das colunas
+# ------------------------------------------------------------
+
+colunas_base <- c(
+  "id_celula",
+  "ano",
+  "mes",
+  "prec_mensal_soma",
+  "prec_mensal_max",
+  "dias_acima_threshold",
+  "exposicao",
+  "desastre_natural"
+)
+
+faltantes <- setdiff(
+  colunas_base,
+  names(base)
+)
+
+if (length(faltantes) > 0) {
+
+  stop(
+    paste(
+      "Colunas faltantes na base:",
+      paste(faltantes, collapse = ", ")
+    )
+  )
+}
+
+
+colunas_ybar <- c(
+  "id_celula",
+  "ano",
+  "mes",
+  "y_bar"
+)
+
+faltantes_ybar <- setdiff(
+  colunas_ybar,
+  names(ybar)
+)
+
+if (length(faltantes_ybar) > 0) {
+
+  stop(
+    paste(
+      "Colunas faltantes no Y_bar:",
+      paste(faltantes_ybar, collapse = ", ")
+    )
+  )
+}
+
+
+# ------------------------------------------------------------
+# Tipos
+# ------------------------------------------------------------
+
+base <- base %>%
+  mutate(
+    id_celula = as.character(id_celula),
+    ano = as.integer(ano),
+    mes = as.integer(mes),
+    desastre_natural = as.integer(desastre_natural),
+    exposicao = as.numeric(exposicao)
+  )
+
+ybar <- ybar %>%
+  mutate(
+    id_celula = as.character(id_celula),
+    ano = as.integer(ano),
+    mes = as.integer(mes),
+    y_bar = as.integer(y_bar)
+  )
+```
+
+# 4. Matriz de adjacência \(A\)
+
+```{r matriz-A}
+# ============================================================
+# 4. MATRIZ DE ADJACENCIA
+# ============================================================
+
+grid_order <- as.character(
+  A_df[[1]]
+)
+
+A <- as.matrix(
+  A_df[, -1, drop = FALSE]
+)
+
+storage.mode(A) <- "numeric"
+
+rownames(A) <- grid_order
+
+# Nomes das colunas vindos do CSV
+colnames_A <- colnames(A_df)[-1]
+
+colnames(A) <- colnames_A
+
+
+# ------------------------------------------------------------
+# Garantir que linhas e colunas estejam na mesma ordem
+# ------------------------------------------------------------
+
+if (!all(grid_order %in% colnames(A))) {
+
+  stop(
+    "Os IDs das linhas de A nao coincidem com os nomes das colunas."
+  )
+}
+
+A <- A[
+  grid_order,
+  grid_order,
+  drop = FALSE
+]
+
+
+# ------------------------------------------------------------
+# Validacoes
+# ------------------------------------------------------------
+
+stopifnot(
+  nrow(A) == 25,
+  ncol(A) == 25
+)
+
+stopifnot(
+  all(diag(A) == 0)
+)
+
+stopifnot(
+  isTRUE(
+    all.equal(
+      A,
+      t(A)
+    )
+  )
+)
+
+
+cat(
+  "Dimensao de A:",
+  nrow(A), "x", ncol(A), "\n"
+)
+
+cat(
+  "Pares unicos de vizinhos:",
+  sum(A) / 2,
+  "\n"
+)
+
+cat(
+  "Numero de vizinhos por grid:\n"
+)
+
+print(
+  rowSums(A)
+)
+```
+
+# 5. Construção do componente \(A\bar{Y}_{t-1}\)
+
+A variável abaixo representa, para cada grade e mês:
+
+\[
+S_{g,t}
+=
+(A\bar Y_{t-1})_g.
+\]
+
+Como \(A\) é binária e Rook, \(S_{g,t}\) é o **número de grids vizinhos que tiveram shock no mês anterior**.
+
+```{r spatial-lag}
+# ============================================================
+# 5. JUNTAR Y_BAR A BASE
+# ============================================================
+
+base <- base %>%
+
+  left_join(
+
+    ybar %>%
+      select(
+        id_celula,
+        ano,
+        mes,
+        y_bar
+      ),
+
+    by = c(
+      "id_celula",
+      "ano",
+      "mes"
+    )
+
+  )
+
+
+if (any(is.na(base$y_bar))) {
+  stop("Existem observacoes sem y_bar apos o join.")
+}
+
+
+# ------------------------------------------------------------
+# Criar identificador temporal
+# ------------------------------------------------------------
+
+base <- base %>%
+
+  mutate(
+
+    data_mes =
+      as.Date(
+        sprintf(
+          "%04d-%02d-01",
+          ano,
+          mes
+        )
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# Funcao para calcular A %*% Y_bar(t-1)
+# ------------------------------------------------------------
+
+calcular_spatial_lag <- function(
+    dados,
+    A,
+    grid_order
+) {
+
+  dados$spatial_lag <- 0
+
+  meses <- sort(
+    unique(
+      dados$data_mes
+    )
+  )
+
+  # Primeiro mes nao possui t-1 dentro da amostra.
+  # Portanto spatial_lag = 0.
+
+  if (length(meses) <= 1) {
+    return(dados)
+  }
+
+  for (k in 2:length(meses)) {
+
+    mes_atual <- meses[k]
+    mes_anterior <- meses[k - 1]
+
+    anterior <- dados %>%
+
+      filter(
+        data_mes == mes_anterior
+      ) %>%
+
+      select(
+        id_celula,
+        y_bar
+      )
+
+
+    vetor_ybar <- rep(
+      0,
+      length(grid_order)
+    )
+
+    names(vetor_ybar) <- grid_order
+
+
+    vetor_ybar[
+      anterior$id_celula
+    ] <- anterior$y_bar
+
+
+    # Multiplicacao matricial
+
+    vetor_spatial <-
+      as.numeric(
+        A %*% vetor_ybar
+      )
+
+    names(vetor_spatial) <-
+      grid_order
+
+
+    idx <- which(
+      dados$data_mes == mes_atual
+    )
+
+    dados$spatial_lag[idx] <-
+      vetor_spatial[
+        dados$id_celula[idx]
+      ]
+
+  }
+
+  dados
+}
+
+
+base <- calcular_spatial_lag(
+  dados = base,
+  A = A,
+  grid_order = grid_order
+)
+
+
+# ------------------------------------------------------------
+# Validacao
+# ------------------------------------------------------------
+
+cat(
+  "Distribuicao de A %*% Y_bar(t-1):\n"
+)
+
+print(
+  table(
+    base$spatial_lag
+  )
+)
+```
+
+# 6. Estatísticas descritivas
+
+```{r descritivas}
+# ============================================================
+# 6. DESCRITIVAS
+# ============================================================
+
+resumo_amostra <- tibble(
+
+  metrica = c(
+    "Observacoes",
+    "Grades",
+    "Meses",
+    "Desastres",
+    "Grid-meses com Y > 0",
+    "Shocks Y_bar = 1",
+    "Maximo Y em grid-mes"
+  ),
+
+  valor = c(
+    nrow(base),
+    n_distinct(base$id_celula),
+    n_distinct(base$data_mes),
+    sum(base$desastre_natural),
+    sum(base$desastre_natural > 0),
+    sum(base$y_bar),
+    max(base$desastre_natural)
+  )
+
+)
+
+kable(
+  resumo_amostra,
+  digits = 3,
+  caption = "Resumo da base utilizada"
+)
+```
+
+```{r plot-desastres-ano}
+base %>%
+
+  group_by(
+    ano
+  ) %>%
+
+  summarise(
+    desastres =
+      sum(desastre_natural)
+  ) %>%
+
+  ggplot(
+    aes(
+      x = ano,
+      y = desastres
+    )
+  ) +
+
+  geom_col() +
+
+  labs(
+    title = "Desastres naturais por ano",
+    x = "Ano",
+    y = "Número de desastres"
+  ) +
+
+  theme_minimal()
+```
+
+# 7. Separação treino e teste
+
+Para manter uma avaliação temporal:
+
+- **Treino:** 2001 até `r TRAIN_END_YEAR`
+- **Teste:** `r TRAIN_END_YEAR + 1` até 2025
+
+```{r train-test}
+# ============================================================
+# 7. TRAIN / TEST
+# ============================================================
+
+base <- base %>%
+
+  mutate(
+
+    amostra =
+      if_else(
+        ano <= TRAIN_END_YEAR,
+        "Treino",
+        "Teste"
+      )
+
+  )
+
+
+table(
+  base$amostra
+)
+```
+
+# 8. Padronização das covariáveis
+
+A padronização é calculada **somente no conjunto de treino**.
+
+```{r padronizacao}
+# ============================================================
+# 8. ESCALA DOS X
+# ============================================================
+
+x_vars <- c(
+  "prec_mensal_soma",
+  "prec_mensal_max",
+  "dias_acima_threshold"
+)
+
+
+medias_x <- sapply(
+  base[
+    base$amostra == "Treino",
+    x_vars
+  ],
+  mean,
+  na.rm = TRUE
+)
+
+
+sds_x <- sapply(
+  base[
+    base$amostra == "Treino",
+    x_vars
+  ],
+  sd,
+  na.rm = TRUE
+)
+
+
+base <- base %>%
+
+  mutate(
+
+    X1 =
+      (
+        prec_mensal_soma -
+        medias_x["prec_mensal_soma"]
+      ) /
+      sds_x["prec_mensal_soma"],
+
+    X2 =
+      (
+        prec_mensal_max -
+        medias_x["prec_mensal_max"]
+      ) /
+      sds_x["prec_mensal_max"],
+
+    X3 =
+      (
+        dias_acima_threshold -
+        medias_x["dias_acima_threshold"]
+      ) /
+      sds_x["dias_acima_threshold"]
+
+  )
+
+
+treino <- base %>%
+  filter(amostra == "Treino")
+
+teste <- base %>%
+  filter(amostra == "Teste")
+
+
+# Matriz X com intercepto
+
+criar_X <- function(dados) {
+
+  cbind(
+    Intercepto = 1,
+    X1_prec_mensal = dados$X1,
+    X2_max_diaria = dados$X2,
+    X3_dias_extremos = dados$X3
+  )
+
+}
+
+
+X_train <- criar_X(treino)
+X_test <- criar_X(teste)
+
+
+y_train <- treino$desastre_natural
+y_test <- teste$desastre_natural
+
+E_train <- treino$exposicao
+E_test <- teste$exposicao
+
+S_train <- treino$spatial_lag
+S_test <- teste$spatial_lag
+
+
+grid_idx_train <- match(
+  treino$id_celula,
+  grid_order
+)
+
+grid_idx_test <- match(
+  teste$id_celula,
+  grid_order
+)
+```
+
+# 9. Modelo benchmark: Negative Binomial sem componente espacial
+
+O benchmark é:
+
+\[
+\lambda_{g,t}
+=
+E_{g,t}
+\exp(\beta^T X_{g,t}).
+\]
+
+```{r modelo-nb}
+# ============================================================
+# 9. NB BENCHMARK
+# ============================================================
+
+fit_nb <- MASS::glm.nb(
+
+  desastre_natural ~
+    X1 +
+    X2 +
+    X3 +
+    offset(
+      log(exposicao)
+    ),
+
+  data = treino,
+
+  link = log
+
+)
+
+
+summary(
+  fit_nb
+)
+```
+
+```{r nb-pred}
+# Predicoes
+
+mu_nb_train <- as.numeric(
+  predict(
+    fit_nb,
+    newdata = treino,
+    type = "response"
+  )
+)
+
+mu_nb_test <- as.numeric(
+  predict(
+    fit_nb,
+    newdata = teste,
+    type = "response"
+  )
+)
+
+phi_nb <- fit_nb$theta
+
+cat(
+  "Phi NB =",
+  phi_nb,
+  "\n"
+)
+```
+
+# 10. Funções auxiliares do SP-NB
+
+```{r funcoes-spnb}
+# ============================================================
+# 10. FUNCOES DO SP-NB
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Calcular lambda
+# ------------------------------------------------------------
+
+calcular_mu_spnb <- function(
+    beta,
+    gamma_psi,
+    X,
+    E,
+    S,
+    grid_idx,
+    tipo = c(
+      "global",
+      "grid"
+    )
+) {
+
+  tipo <- match.arg(tipo)
+
+  eta <- as.numeric(
+    X %*% beta
+  )
+
+  taxa_base <- exp(
+    pmin(
+      eta,
+      30
+    )
+  )
+
+
+  if (tipo == "global") {
+
+    psi <- exp(
+      gamma_psi[1]
+    )
+
+    taxa_spatial <-
+      psi *
+      S
+
+  } else {
+
+    psi <- exp(
+      gamma_psi
+    )
+
+    taxa_spatial <-
+      psi[
+        grid_idx
+      ] *
+      S
+
+  }
+
+
+  mu <-
+    E *
+    (
+      taxa_base +
+      taxa_spatial
+    )
+
+
+  pmax(
+    mu,
+    EPS
+  )
+}
+
+
+# ------------------------------------------------------------
+# Log-likelihood marginal NB
+# ------------------------------------------------------------
+
+loglik_nb <- function(
+    y,
+    mu,
+    phi
+) {
+
+  sum(
+    dnbinom(
+      y,
+      mu = mu,
+      size = phi,
+      log = TRUE
+    )
+  )
+}
+
+
+# ------------------------------------------------------------
+# Algoritmo EM
+# ------------------------------------------------------------
+
+fit_spnb_em <- function(
+    y,
+    X,
+    E,
+    S,
+    grid_idx,
+    n_grids,
+    beta_init,
+    phi_init,
+    tipo = c(
+      "global",
+      "grid"
+    ),
+    max_iter = 300,
+    tol = 1e-6,
+    verbose = TRUE
+) {
+
+  tipo <- match.arg(tipo)
+
+  p <- ncol(X)
+
+
+  # ----------------------------------------------------------
+  # Inicializacao
+  # ----------------------------------------------------------
+
+  beta <- beta_init
+
+  phi <- max(
+    phi_init,
+    0.01
+  )
+
+
+  if (tipo == "global") {
+
+    gamma_psi <-
+      log(
+        0.001
+      )
+
+  } else {
+
+    gamma_psi <- rep(
+      log(0.001),
+      n_grids
+    )
+
+  }
+
+
+  historico <- tibble()
+
+  ll_anterior <- -Inf
+
+
+  # ==========================================================
+  # EM LOOP
+  # ==========================================================
+
+  for (iter in 1:max_iter) {
+
+
+    # --------------------------------------------------------
+    # Lambda atual
+    # --------------------------------------------------------
+
+    mu <- calcular_mu_spnb(
+
+      beta = beta,
+      gamma_psi = gamma_psi,
+
+      X = X,
+      E = E,
+      S = S,
+
+      grid_idx = grid_idx,
+
+      tipo = tipo
+
+    )
+
+
+    # ========================================================
+    # E-STEP
+    #
+    # Posterior:
+    #
+    # Z | Y ~ Gamma(
+    #   phi + Y,
+    #   phi + lambda
+    # )
+    #
+    # w1 = E[Z | Y]
+    # w2 = E[log Z | Y]
+    # ========================================================
+
+    w1 <-
+      (
+        phi +
+        y
+      ) /
+      (
+        phi +
+        mu
+      )
+
+
+    w2 <-
+      digamma(
+        phi +
+        y
+      ) -
+      log(
+        phi +
+        mu
+      )
+
+
+    # ========================================================
+    # M-STEP - BETA E PSI
+    # ========================================================
+
+    par_atual <- c(
+      beta,
+      gamma_psi
+    )
+
+
+    objetivo_media <- function(par) {
+
+      beta_novo <-
+        par[
+          1:p
+        ]
+
+
+      gamma_novo <-
+        par[
+          (p + 1):
+            length(par)
+        ]
+
+
+      mu_novo <- calcular_mu_spnb(
+
+        beta =
+          beta_novo,
+
+        gamma_psi =
+          gamma_novo,
+
+        X = X,
+        E = E,
+        S = S,
+
+        grid_idx =
+          grid_idx,
+
+        tipo =
+          tipo
+
+      )
+
+
+      # Q referente a parte Poisson
+
+      Q <-
+        sum(
+          y *
+            log(
+              mu_novo
+            ) -
+            w1 *
+            mu_novo
+        )
+
+
+      -Q
+    }
+
+
+    # Limites para estabilidade numerica
+
+    lower <- c(
+      rep(-20, p),
+      rep(
+        log(1e-10),
+        length(gamma_psi)
+      )
+    )
+
+    upper <- c(
+      rep(20, p),
+      rep(
+        log(100),
+        length(gamma_psi)
+      )
+    )
+
+
+    opt_media <- optim(
+
+      par =
+        par_atual,
+
+      fn =
+        objetivo_media,
+
+      method =
+        "L-BFGS-B",
+
+      lower =
+        lower,
+
+      upper =
+        upper,
+
+      control =
+        list(
+          maxit = 200
+        )
+
+    )
+
+
+    beta <-
+      opt_media$par[
+        1:p
+      ]
+
+
+    gamma_psi <-
+      opt_media$par[
+        (p + 1):
+          length(
+            opt_media$par
+          )
+      ]
+
+
+    # ========================================================
+    # M-STEP - PHI
+    # ========================================================
+
+    objetivo_phi <- function(
+        log_phi
+    ) {
+
+      phi_novo <-
+        exp(
+          log_phi
+        )
+
+
+      # E[log g(Z; phi)]
+
+      Q_phi <-
+
+        length(y) *
+        (
+          phi_novo *
+            log(phi_novo) -
+            lgamma(phi_novo)
+        ) +
+
+        (
+          phi_novo - 1
+        ) *
+        sum(w2) -
+
+        phi_novo *
+        sum(w1)
+
+
+      -Q_phi
+    }
+
+
+    opt_phi <- optimize(
+
+      objetivo_phi,
+
+      interval = c(
+        log(1e-4),
+        log(1e5)
+      )
+
+    )
+
+
+    phi <- exp(
+      opt_phi$minimum
+    )
+
+
+    # --------------------------------------------------------
+    # Nova likelihood marginal
+    # --------------------------------------------------------
+
+    mu <- calcular_mu_spnb(
+
+      beta =
+        beta,
+
+      gamma_psi =
+        gamma_psi,
+
+      X = X,
+      E = E,
+      S = S,
+
+      grid_idx =
+        grid_idx,
+
+      tipo =
+        tipo
+
+    )
+
+
+    ll <- loglik_nb(
+      y = y,
+      mu = mu,
+      phi = phi
+    )
+
+
+    delta_ll <-
+      abs(
+        ll -
+        ll_anterior
+      )
+
+
+    historico <- bind_rows(
+
+      historico,
+
+      tibble(
+
+        iteracao =
+          iter,
+
+        logLik =
+          ll,
+
+        delta_logLik =
+          delta_ll,
+
+        phi =
+          phi
+
+      )
+
+    )
+
+
+    if (
+      verbose &&
+      (
+        iter == 1 ||
+        iter %% 10 == 0
+      )
+    ) {
+
+      cat(
+
+        "Iteracao:",
+        iter,
+
+        "| logLik:",
+        round(ll, 4),
+
+        "| delta:",
+        round(delta_ll, 8),
+
+        "| phi:",
+        round(phi, 4),
+
+        "\n"
+
+      )
+
+    }
+
+
+    # --------------------------------------------------------
+    # Convergencia
+    # --------------------------------------------------------
+
+    if (
+      iter > 1 &&
+      delta_ll < tol
+    ) {
+
+      if (verbose) {
+
+        cat(
+          "\nConvergencia atingida na iteracao",
+          iter,
+          "\n"
+        )
+
+      }
+
+      break
+    }
+
+
+    ll_anterior <- ll
+
+  }
+
+
+  # ----------------------------------------------------------
+  # Resultado
+  # ----------------------------------------------------------
+
+  psi <- exp(
+    gamma_psi
+  )
+
+
+  list(
+
+    beta =
+      beta,
+
+    gamma_psi =
+      gamma_psi,
+
+    psi =
+      psi,
+
+    phi =
+      phi,
+
+    mu =
+      mu,
+
+    logLik =
+      ll,
+
+    historico =
+      historico,
+
+    iteracoes =
+      iter,
+
+    convergiu =
+      (
+        iter < max_iter
+      ),
+
+    tipo =
+      tipo
+
+  )
+}
+```
+
+# 11. Inicialização com o modelo NB
+
+```{r inicializacao}
+# ============================================================
+# 11. INICIALIZACAO
+# ============================================================
+
+beta_init <- coef(
+  fit_nb
+)
+
+# glm.nb devolve:
+# (Intercept), X1, X2, X3
+
+beta_init <- as.numeric(
+  beta_init[
+    c(
+      "(Intercept)",
+      "X1",
+      "X2",
+      "X3"
+    )
+  ]
+)
+
+phi_init <- fit_nb$theta
+
+
+cat(
+  "Beta inicial:\n"
+)
+
+print(
+  beta_init
+)
+
+cat(
+  "\nPhi inicial:",
+  phi_init,
+  "\n"
+)
+```
+
+# 12. SP-NB com \(\psi\) global
+
+```{r spnb-global, cache=TRUE}
+# ============================================================
+# 12. SP-NB GLOBAL
+# ============================================================
+
+fit_sp_global <- fit_spnb_em(
+
+  y =
+    y_train,
+
+  X =
+    X_train,
+
+  E =
+    E_train,
+
+  S =
+    S_train,
+
+  grid_idx =
+    grid_idx_train,
+
+  n_grids =
+    length(grid_order),
+
+  beta_init =
+    beta_init,
+
+  phi_init =
+    phi_init,
+
+  tipo =
+    "global",
+
+  max_iter =
+    MAX_ITER_EM,
+
+  tol =
+    TOL_EM,
+
+  verbose =
+    TRUE
+
+)
+```
+
+# 13. SP-NB com \(\psi_g\) por grade
+
+```{r spnb-grid, cache=TRUE}
+# ============================================================
+# 13. SP-NB GRID-SPECIFIC
+# ============================================================
+
+fit_sp_grid <- fit_spnb_em(
+
+  y =
+    y_train,
+
+  X =
+    X_train,
+
+  E =
+    E_train,
+
+  S =
+    S_train,
+
+  grid_idx =
+    grid_idx_train,
+
+  n_grids =
+    length(grid_order),
+
+  beta_init =
+    beta_init,
+
+  phi_init =
+    phi_init,
+
+  tipo =
+    "grid",
+
+  max_iter =
+    MAX_ITER_EM,
+
+  tol =
+    TOL_EM,
+
+  verbose =
+    TRUE
+
+)
+```
+
+# 14. Convergência do EM
+
+```{r convergencia}
+historico_global <- fit_sp_global$historico %>%
+  mutate(
+    modelo = "SP-NB Global"
+  )
+
+historico_grid <- fit_sp_grid$historico %>%
+  mutate(
+    modelo = "SP-NB por Grid"
+  )
+
+
+historico_em <- bind_rows(
+  historico_global,
+  historico_grid
+)
+
+
+ggplot(
+  historico_em,
+  aes(
+    x = iteracao,
+    y = logLik,
+    linetype = modelo
+  )
+) +
+
+  geom_line(
+    linewidth = 0.8
+  ) +
+
+  labs(
+    title = "Convergência do algoritmo EM",
+    x = "Iteração",
+    y = "Log-likelihood",
+    linetype = "Modelo"
+  ) +
+
+  theme_minimal()
+```
+
+```{r resumo-convergencia}
+tibble(
+
+  modelo =
+    c(
+      "SP-NB Global",
+      "SP-NB por Grid"
+    ),
+
+  convergiu =
+    c(
+      fit_sp_global$convergiu,
+      fit_sp_grid$convergiu
+    ),
+
+  iteracoes =
+    c(
+      fit_sp_global$iteracoes,
+      fit_sp_grid$iteracoes
+    ),
+
+  logLik_final =
+    c(
+      fit_sp_global$logLik,
+      fit_sp_grid$logLik
+    )
+
+) %>%
+
+  kable(
+    digits = 4,
+    caption = "Convergência dos modelos SP-NB"
+  )
+```
+
+# 15. Predições fora da amostra
+
+```{r predicoes-sp}
+# ============================================================
+# 15. PREDICOES
+# ============================================================
+
+# SP-NB global
+
+mu_sp_global_train <- calcular_mu_spnb(
+
+  beta =
+    fit_sp_global$beta,
+
+  gamma_psi =
+    fit_sp_global$gamma_psi,
+
+  X =
+    X_train,
+
+  E =
+    E_train,
+
+  S =
+    S_train,
+
+  grid_idx =
+    grid_idx_train,
+
+  tipo =
+    "global"
+
+)
+
+
+mu_sp_global_test <- calcular_mu_spnb(
+
+  beta =
+    fit_sp_global$beta,
+
+  gamma_psi =
+    fit_sp_global$gamma_psi,
+
+  X =
+    X_test,
+
+  E =
+    E_test,
+
+  S =
+    S_test,
+
+  grid_idx =
+    grid_idx_test,
+
+  tipo =
+    "global"
+
+)
+
+
+# SP-NB por grid
+
+mu_sp_grid_train <- calcular_mu_spnb(
+
+  beta =
+    fit_sp_grid$beta,
+
+  gamma_psi =
+    fit_sp_grid$gamma_psi,
+
+  X =
+    X_train,
+
+  E =
+    E_train,
+
+  S =
+    S_train,
+
+  grid_idx =
+    grid_idx_train,
+
+  tipo =
+    "grid"
+
+)
+
+
+mu_sp_grid_test <- calcular_mu_spnb(
+
+  beta =
+    fit_sp_grid$beta,
+
+  gamma_psi =
+    fit_sp_grid$gamma_psi,
+
+  X =
+    X_test,
+
+  E =
+    E_test,
+
+  S =
+    S_test,
+
+  grid_idx =
+    grid_idx_test,
+
+  tipo =
+    "grid"
+
+)
+```
+
+# 16. Métricas de avaliação
+
+```{r funcoes-metricas}
+# ============================================================
+# 16. METRICAS
+# ============================================================
+
+
+roc_auc_manual <- function(
+    y_bin,
+    prob
+) {
+
+  n1 <- sum(
+    y_bin == 1
+  )
+
+  n0 <- sum(
+    y_bin == 0
+  )
+
+  if (
+    n1 == 0 ||
+    n0 == 0
+  ) {
+
+    return(
+      NA_real_
+    )
+  }
+
+  ranks <- rank(
+    prob,
+    ties.method = "average"
+  )
+
+  (
+    sum(
+      ranks[
+        y_bin == 1
+      ]
+    ) -
+      n1 *
+      (
+        n1 + 1
+      ) /
+      2
+  ) /
+    (
+      n1 *
+      n0
+    )
+}
+
+
+average_precision <- function(
+    y_bin,
+    prob
+) {
+
+  n_pos <- sum(
+    y_bin == 1
+  )
+
+  if (n_pos == 0) {
+    return(NA_real_)
+  }
+
+  ord <- order(
+    prob,
+    decreasing = TRUE
+  )
+
+  y_ord <-
+    y_bin[
+      ord
+    ]
+
+  precision <-
+    cumsum(
+      y_ord
+    ) /
+    seq_along(
+      y_ord
+    )
+
+  mean(
+    precision[
+      y_ord == 1
+    ]
+  )
+}
+
+
+calcular_metricas <- function(
+    y,
+    mu,
+    phi,
+    k
+) {
+
+  ll <- loglik_nb(
+    y,
+    mu,
+    phi
+  )
+
+
+  prob_evento <-
+    1 -
+    dnbinom(
+      0,
+      mu = mu,
+      size = phi
+    )
+
+
+  y_bin <-
+    as.integer(
+      y > 0
+    )
+
+
+  tibble(
+
+    N =
+      length(y),
+
+    Eventos =
+      sum(y),
+
+    LogLik =
+      ll,
+
+    Menos2LogLik =
+      -2 * ll,
+
+    AIC =
+      -2 * ll +
+      2 * k,
+
+    BIC =
+      -2 * ll +
+      log(length(y)) *
+      k,
+
+    Balance_R =
+      sum(mu) /
+      sum(y),
+
+    MAE =
+      mean(
+        abs(
+          y - mu
+        )
+      ),
+
+    RMSE =
+      sqrt(
+        mean(
+          (
+            y - mu
+          )^2
+        )
+      ),
+
+    LogScore_medio =
+      mean(
+        dnbinom(
+          y,
+          mu = mu,
+          size = phi,
+          log = TRUE
+        )
+      ),
+
+    Brier =
+      mean(
+        (
+          y_bin -
+            prob_evento
+        )^2
+      ),
+
+    ROC_AUC =
+      roc_auc_manual(
+        y_bin,
+        prob_evento
+      ),
+
+    PR_AUC_AP =
+      average_precision(
+        y_bin,
+        prob_evento
+      )
+
+  )
+}
+```
+
+```{r metricas-modelos}
+# ============================================================
+# Numero de parametros
+# ============================================================
+
+p_beta <- ncol(
+  X_train
+)
+
+k_nb <-
+  p_beta +
+  1
+
+k_sp_global <-
+  p_beta +
+  1 + # psi
+  1   # phi
+
+k_sp_grid <-
+  p_beta +
+  length(grid_order) +
+  1
+
+
+# ------------------------------------------------------------
+# TREINO
+# ------------------------------------------------------------
+
+metricas_train <- bind_rows(
+
+  calcular_metricas(
+    y_train,
+    mu_nb_train,
+    phi_nb,
+    k_nb
+  ) %>%
+    mutate(
+      Modelo = "NB",
+      Amostra = "Treino"
+    ),
+
+  calcular_metricas(
+    y_train,
+    mu_sp_global_train,
+    fit_sp_global$phi,
+    k_sp_global
+  ) %>%
+    mutate(
+      Modelo = "SP-NB Global",
+      Amostra = "Treino"
+    ),
+
+  calcular_metricas(
+    y_train,
+    mu_sp_grid_train,
+    fit_sp_grid$phi,
+    k_sp_grid
+  ) %>%
+    mutate(
+      Modelo = "SP-NB por Grid",
+      Amostra = "Treino"
+    )
+
+)
+
+
+# ------------------------------------------------------------
+# TESTE
+# ------------------------------------------------------------
+
+metricas_test <- bind_rows(
+
+  calcular_metricas(
+    y_test,
+    mu_nb_test,
+    phi_nb,
+    k_nb
+  ) %>%
+    mutate(
+      Modelo = "NB",
+      Amostra = "Teste"
+    ),
+
+  calcular_metricas(
+    y_test,
+    mu_sp_global_test,
+    fit_sp_global$phi,
+    k_sp_global
+  ) %>%
+    mutate(
+      Modelo = "SP-NB Global",
+      Amostra = "Teste"
+    ),
+
+  calcular_metricas(
+    y_test,
+    mu_sp_grid_test,
+    fit_sp_grid$phi,
+    k_sp_grid
+  ) %>%
+    mutate(
+      Modelo = "SP-NB por Grid",
+      Amostra = "Teste"
+    )
+
+)
+
+
+metricas <- bind_rows(
+  metricas_train,
+  metricas_test
+) %>%
+
+  select(
+    Modelo,
+    Amostra,
+    everything()
+  )
+
+
+kable(
+  metricas,
+  digits = 4,
+  caption = "Comparação dos modelos"
+)
+```
+
+# 17. Coeficientes \(\beta\)
+
+```{r beta-resultados}
+# ============================================================
+# 17. BETA
+# ============================================================
+
+coef_nb <- coef(
+  fit_nb
+)
+
+tabela_beta <- tibble(
+
+  Variavel =
+    c(
+      "Intercepto",
+      "Precipitacao mensal",
+      "Maxima diaria",
+      "Dias extremos"
+    ),
+
+  NB =
+    as.numeric(
+      coef_nb[
+        c(
+          "(Intercept)",
+          "X1",
+          "X2",
+          "X3"
+        )
+      ]
+    ),
+
+  SP_NB_Global =
+    fit_sp_global$beta,
+
+  SP_NB_Grid =
+    fit_sp_grid$beta
+
+)
+
+
+kable(
+  tabela_beta,
+  digits = 5,
+  caption = "Coeficientes das covariáveis"
+)
+```
+
+# 18. Parâmetro de dispersão \(\phi\)
+
+```{r phi-resultados}
+tabela_phi <- tibble(
+
+  Modelo =
+    c(
+      "NB",
+      "SP-NB Global",
+      "SP-NB por Grid"
+    ),
+
+  phi =
+    c(
+      phi_nb,
+      fit_sp_global$phi,
+      fit_sp_grid$phi
+    )
+
+)
+
+
+kable(
+  tabela_phi,
+  digits = 5,
+  caption = "Parâmetro de dispersão"
+)
+```
+
+# 19. Efeitos espaço-temporais \(\psi\)
+
+```{r psi-resultados}
+# ============================================================
+# 19. PSI
+# ============================================================
+
+psi_global <-
+  fit_sp_global$psi
+
+
+tabela_psi <- tibble(
+
+  id_celula =
+    grid_order,
+
+  psi_global =
+    rep(
+      psi_global,
+      length(grid_order)
+    ),
+
+  psi_grid =
+    fit_sp_grid$psi
+
+)
+
+
+# Adicionar quantidade de shocks e vezes em que houve
+# vizinho ativo no treino
+
+diagnostico_grid <- treino %>%
+
+  group_by(
+    id_celula
+  ) %>%
+
+  summarise(
+
+    desastres =
+      sum(
+        desastre_natural
+      ),
+
+    shocks =
+      sum(
+        y_bar
+      ),
+
+    meses_vizinho_shock =
+      sum(
+        spatial_lag > 0
+      ),
+
+    media_vizinhos_shock =
+      mean(
+        spatial_lag
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+tabela_psi <- tabela_psi %>%
+
+  left_join(
+
+    diagnostico_grid,
+
+    by =
+      "id_celula"
+
+  ) %>%
+
+  arrange(
+    desc(
+      psi_grid
+    )
+  )
+
+
+kable(
+  tabela_psi,
+  digits = 6,
+  caption = "Loadings espaço-temporais por grade"
+)
+```
+
+```{r plot-psi}
+ggplot(
+
+  tabela_psi,
+
+  aes(
+    x = reorder(
+      id_celula,
+      psi_grid
+    ),
+    y = psi_grid
+  )
+
+) +
+
+  geom_col() +
+
+  coord_flip() +
+
+  labs(
+    title = "Efeito espaço-temporal estimado por grade",
+    x = "Grade",
+    y = expression(hat(psi)[g])
+  ) +
+
+  theme_minimal()
+```
+
+# 20. Decomposição da previsão SP-NB
+
+A previsão pode ser decomposta em:
+
+\[
+\lambda_{g,t}
+=
+\lambda^{clima}_{g,t}
++
+\lambda^{espacial}_{g,t}.
+\]
+
+```{r decomposicao}
+# ============================================================
+# 20. DECOMPOSICAO
+# ============================================================
+
+calcular_componentes <- function(
+    dados,
+    X,
+    beta,
+    psi,
+    tipo,
+    grid_idx
+) {
+
+  eta <-
+    as.numeric(
+      X %*% beta
+    )
+
+  taxa_clima <-
+    exp(
+      pmin(
+        eta,
+        30
+      )
+    )
+
+
+  if (tipo == "global") {
+
+    taxa_espacial <-
+      psi[1] *
+      dados$spatial_lag
+
+  } else {
+
+    taxa_espacial <-
+      psi[
+        grid_idx
+      ] *
+      dados$spatial_lag
+
+  }
+
+
+  dados %>%
+
+    mutate(
+
+      taxa_clima =
+        taxa_clima,
+
+      taxa_espacial =
+        taxa_espacial,
+
+      lambda_clima =
+        exposicao *
+        taxa_clima,
+
+      lambda_espacial =
+        exposicao *
+        taxa_espacial,
+
+      lambda_total =
+        lambda_clima +
+        lambda_espacial,
+
+      pct_lambda_espacial =
+        if_else(
+          lambda_total > 0,
+          lambda_espacial /
+            lambda_total,
+          0
+        )
+
+    )
+}
+
+
+pred_sp_grid_todos <- calcular_componentes(
+
+  dados =
+    base,
+
+  X =
+    criar_X(base),
+
+  beta =
+    fit_sp_grid$beta,
+
+  psi =
+    fit_sp_grid$psi,
+
+  tipo =
+    "grid",
+
+  grid_idx =
+    match(
+      base$id_celula,
+      grid_order
+    )
+
+)
+```
+
+```{r resumo-decomposicao}
+resumo_componentes <- pred_sp_grid_todos %>%
+
+  summarise(
+
+    lambda_clima_total =
+      sum(
+        lambda_clima
+      ),
+
+    lambda_espacial_total =
+      sum(
+        lambda_espacial
+      ),
+
+    lambda_total =
+      sum(
+        lambda_total
+      ),
+
+    pct_espacial_total =
+      lambda_espacial_total /
+      lambda_total
+
+  )
+
+
+kable(
+  resumo_componentes,
+  digits = 4,
+  caption = "Decomposição agregada da intensidade prevista"
+)
+```
+
+# 21. Observado versus previsto ao longo do tempo
+
+```{r observado-previsto}
+comparacao_tempo <- pred_sp_grid_todos %>%
+
+  group_by(
+    ano,
+    mes,
+    data_mes
+  ) %>%
+
+  summarise(
+
+    Observado =
+      sum(
+        desastre_natural
+      ),
+
+    Previsto =
+      sum(
+        lambda_total
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+ggplot(
+  comparacao_tempo,
+  aes(
+    x = data_mes
+  )
+) +
+
+  geom_line(
+    aes(
+      y = Observado,
+      linetype = "Observado"
+    ),
+    linewidth = 0.7
+  ) +
+
+  geom_line(
+    aes(
+      y = Previsto,
+      linetype = "Previsto"
+    ),
+    linewidth = 0.7
+  ) +
+
+  labs(
+    title = "Desastres observados e esperados pelo SP-NB",
+    x = "Tempo",
+    y = "Número de desastres",
+    linetype = NULL
+  ) +
+
+  theme_minimal()
+```
+
+# 22. Observado versus previsto por ano
+
+```{r observado-previsto-ano}
+comparacao_ano <- pred_sp_grid_todos %>%
+
+  group_by(
+    ano
+  ) %>%
+
+  summarise(
+
+    Observado =
+      sum(
+        desastre_natural
+      ),
+
+    Previsto =
+      sum(
+        lambda_total
+      ),
+
+    .groups =
+      "drop"
+
+  ) %>%
+
+  pivot_longer(
+
+    cols =
+      c(
+        Observado,
+        Previsto
+      ),
+
+    names_to =
+      "Serie",
+
+    values_to =
+      "Eventos"
+
+  )
+
+
+ggplot(
+
+  comparacao_ano,
+
+  aes(
+    x = ano,
+    y = Eventos,
+    linetype = Serie
+  )
+
+) +
+
+  geom_line(
+    linewidth = 0.9
+  ) +
+
+  geom_point() +
+
+  labs(
+    title = "Eventos observados versus previstos por ano",
+    x = "Ano",
+    y = "Número de eventos",
+    linetype = NULL
+  ) +
+
+  theme_minimal()
+```
+
+# 23. Erros-padrão aproximados via Hessiana
+
+```{r hessiana-funcoes}
+# ============================================================
+# 23. HESSIANA NUMERICA
+# ============================================================
+
+nll_sp_transf <- function(
+    par,
+    y,
+    X,
+    E,
+    S,
+    grid_idx,
+    tipo
+) {
+
+  p <- ncol(X)
+
+  beta <-
+    par[
+      1:p
+    ]
+
+
+  if (tipo == "global") {
+
+    gamma_psi <-
+      par[
+        p + 1
+      ]
+
+    log_phi <-
+      par[
+        p + 2
+      ]
+
+  } else {
+
+    G <- max(
+      grid_idx
+    )
+
+    gamma_psi <-
+      par[
+        (p + 1):
+          (p + G)
+      ]
+
+    log_phi <-
+      par[
+        p + G + 1
+      ]
+
+  }
+
+
+  phi <-
+    exp(
+      log_phi
+    )
+
+
+  mu <- calcular_mu_spnb(
+
+    beta =
+      beta,
+
+    gamma_psi =
+      gamma_psi,
+
+    X =
+      X,
+
+    E =
+      E,
+
+    S =
+      S,
+
+    grid_idx =
+      grid_idx,
+
+    tipo =
+      tipo
+
+  )
+
+
+  -loglik_nb(
+    y,
+    mu,
+    phi
+  )
+}
+
+
+extrair_se_sp <- function(
+    fit,
+    y,
+    X,
+    E,
+    S,
+    grid_idx
+) {
+
+  p <- ncol(X)
+
+
+  par_final <- c(
+
+    fit$beta,
+
+    fit$gamma_psi,
+
+    log(
+      fit$phi
+    )
+
+  )
+
+
+  H <- optimHess(
+
+    par =
+      par_final,
+
+    fn =
+      nll_sp_transf,
+
+    y =
+      y,
+
+    X =
+      X,
+
+    E =
+      E,
+
+    S =
+      S,
+
+    grid_idx =
+      grid_idx,
+
+    tipo =
+      fit$tipo
+
+  )
+
+
+  V <- tryCatch(
+
+    solve(H),
+
+    error = function(e) {
+
+      MASS::ginv(
+        H
+      )
+
+    }
+
+  )
+
+
+  se_transf <-
+    sqrt(
+      pmax(
+        diag(V),
+        0
+      )
+    )
+
+
+  se_beta <-
+    se_transf[
+      1:p
+    ]
+
+
+  n_psi <-
+    length(
+      fit$psi
+    )
+
+
+  se_gamma <-
+    se_transf[
+      (p + 1):
+        (p + n_psi)
+    ]
+
+
+  # Delta method:
+  # psi = exp(gamma)
+
+  se_psi <-
+    fit$psi *
+    se_gamma
+
+
+  se_log_phi <-
+    se_transf[
+      p +
+      n_psi +
+      1
+    ]
+
+
+  se_phi <-
+    fit$phi *
+    se_log_phi
+
+
+  list(
+
+    H =
+      H,
+
+    V =
+      V,
+
+    se_beta =
+      se_beta,
+
+    se_psi =
+      se_psi,
+
+    se_phi =
+      se_phi
+
+  )
+}
+```
+
+```{r hessiana-calculo, cache=TRUE}
+if (CALCULAR_SE) {
+
+  se_global <- extrair_se_sp(
+
+    fit =
+      fit_sp_global,
+
+    y =
+      y_train,
+
+    X =
+      X_train,
+
+    E =
+      E_train,
+
+    S =
+      S_train,
+
+    grid_idx =
+      grid_idx_train
+
+  )
+
+
+  se_grid <- extrair_se_sp(
+
+    fit =
+      fit_sp_grid,
+
+    y =
+      y_train,
+
+    X =
+      X_train,
+
+    E =
+      E_train,
+
+    S =
+      S_train,
+
+    grid_idx =
+      grid_idx_train
+
+  )
+
+}
+```
+
+# 24. Tabela detalhada dos coeficientes SP-NB
+
+```{r coeficientes-detalhados}
+if (CALCULAR_SE) {
+
+  nomes_beta <- c(
+    "Intercepto",
+    "Precipitacao mensal",
+    "Maxima diaria",
+    "Dias extremos"
+  )
+
+
+  tabela_beta_detalhada <- tibble(
+
+    Variavel =
+      nomes_beta,
+
+    Estimativa =
+      fit_sp_grid$beta,
+
+    Erro_Padrao =
+      se_grid$se_beta
+
+  ) %>%
+
+    mutate(
+
+      z =
+        Estimativa /
+        Erro_Padrao,
+
+      p_value =
+        2 *
+        pnorm(
+          -abs(z)
+        ),
+
+      IC95_inf =
+        Estimativa -
+        1.96 *
+        Erro_Padrao,
+
+      IC95_sup =
+        Estimativa +
+        1.96 *
+        Erro_Padrao
+
+    )
+
+
+  kable(
+    tabela_beta_detalhada,
+    digits = 5,
+    caption = "Coeficientes do SP-NB por Grid"
+  )
+
+}
+```
+
+```{r psi-detalhado}
+if (CALCULAR_SE) {
+
+  tabela_psi_detalhada <- tibble(
+
+    id_celula =
+      grid_order,
+
+    psi =
+      fit_sp_grid$psi,
+
+    erro_padrao =
+      se_grid$se_psi
+
+  ) %>%
+
+    mutate(
+
+      z =
+        psi /
+        erro_padrao,
+
+      IC95_inf =
+        pmax(
+          0,
+          psi -
+            1.96 *
+            erro_padrao
+        ),
+
+      IC95_sup =
+        psi +
+        1.96 *
+        erro_padrao
+
+    ) %>%
+
+    left_join(
+
+      diagnostico_grid,
+
+      by =
+        "id_celula"
+
+    ) %>%
+
+    arrange(
+      desc(
+        psi
+      )
+    )
+
+
+  kable(
+    tabela_psi_detalhada,
+    digits = 6,
+    caption = "Loadings espaço-temporais e erros-padrão aproximados"
+  )
+
+}
+```
+
+# 25. Resumo executivo dos modelos
+
+```{r resumo-executivo}
+# ============================================================
+# 25. RESUMO PARA APRESENTACAO
+# ============================================================
+
+melhor_aic <- metricas_train %>%
+
+  slice_min(
+    AIC,
+    n = 1
+  ) %>%
+
+  pull(
+    Modelo
+  )
+
+
+melhor_bic <- metricas_train %>%
+
+  slice_min(
+    BIC,
+    n = 1
+  ) %>%
+
+  pull(
+    Modelo
+  )
+
+
+melhor_rmse_teste <- metricas_test %>%
+
+  slice_min(
+    RMSE,
+    n = 1
+  ) %>%
+
+  pull(
+    Modelo
+  )
+
+
+melhor_logscore_teste <- metricas_test %>%
+
+  slice_max(
+    LogScore_medio,
+    n = 1
+  ) %>%
+
+  pull(
+    Modelo
+  )
+
+
+tibble(
+
+  Indicador =
+    c(
+      "Menor AIC no treino",
+      "Menor BIC no treino",
+      "Menor RMSE no teste",
+      "Maior log-score no teste",
+      "Psi global estimado",
+      "Phi SP-NB Grid"
+    ),
+
+  Resultado =
+    c(
+      melhor_aic,
+      melhor_bic,
+      melhor_rmse_teste,
+      melhor_logscore_teste,
+      format(
+        fit_sp_global$psi,
+        digits = 5
+      ),
+      format(
+        fit_sp_grid$phi,
+        digits = 5
+      )
+    )
+
+) %>%
+
+  kable(
+    caption = "Resumo executivo"
+  )
+```
+
+# 26. Exportação dos resultados
+
+```{r exportacao}
+# ============================================================
+# 26. EXPORTAR RESULTADOS
+# ============================================================
+
+dir.create(
+  "resultados_spnb",
+  showWarnings = FALSE
+)
+
+
+write_csv(
+
+  metricas,
+
+  "resultados_spnb/metricas_modelos.csv"
+
+)
+
+
+write_csv(
+
+  tabela_beta,
+
+  "resultados_spnb/coeficientes_beta.csv"
+
+)
+
+
+write_csv(
+
+  tabela_phi,
+
+  "resultados_spnb/phi_modelos.csv"
+
+)
+
+
+write_csv(
+
+  tabela_psi,
+
+  "resultados_spnb/psi_por_grid.csv"
+
+)
+
+
+write_csv(
+
+  historico_em,
+
+  "resultados_spnb/historico_em.csv"
+
+)
+
+
+# ------------------------------------------------------------
+# Predicoes completas
+# ------------------------------------------------------------
+
+predicoes_spnb <- pred_sp_grid_todos %>%
+
+  select(
+
+    id_celula,
+    ano,
+    mes,
+    data_mes,
+
+    desastre_natural,
+
+    exposicao,
+
+    prec_mensal_soma,
+    prec_mensal_max,
+    dias_acima_threshold,
+
+    y_bar,
+    spatial_lag,
+
+    taxa_clima,
+    taxa_espacial,
+
+    lambda_clima,
+    lambda_espacial,
+    lambda_total,
+
+    pct_lambda_espacial,
+
+    amostra
+
+  )
+
+
+write_csv(
+
+  predicoes_spnb,
+
+  "resultados_spnb/predicoes_spnb.csv"
+
+)
+
+
+if (CALCULAR_SE) {
+
+  write_csv(
+
+    tabela_beta_detalhada,
+
+    "resultados_spnb/coeficientes_beta_com_se.csv"
+
+  )
+
+
+  write_csv(
+
+    tabela_psi_detalhada,
+
+    "resultados_spnb/psi_com_se.csv"
+
+  )
+
+}
+
+
+cat(
+  "Resultados salvos em:",
+  file.path(
+    getwd(),
+    "resultados_spnb"
+  ),
+  "\n"
+)
+```
+
+# 27. Principais números para apresentação
+
+```{r numeros-apresentacao}
+cat("\n")
+cat("=============================================\n")
+cat("RESULTADOS PRINCIPAIS\n")
+cat("=============================================\n")
+
+cat(
+  "Observacoes:",
+  nrow(base),
+  "\n"
+)
+
+cat(
+  "Desastres:",
+  sum(base$desastre_natural),
+  "\n"
+)
+
+cat(
+  "Grid-meses com desastre:",
+  sum(base$desastre_natural > 0),
+  "\n"
+)
+
+cat(
+  "Shocks Y_bar:",
+  sum(base$y_bar),
+  "\n"
+)
+
+cat(
+  "Psi global:",
+  round(
+    fit_sp_global$psi,
+    6
+  ),
+  "\n"
+)
+
+cat(
+  "Phi SP-NB Grid:",
+  round(
+    fit_sp_grid$phi,
+    4
+  ),
+  "\n"
+)
+
+cat(
+  "Melhor AIC:",
+  melhor_aic,
+  "\n"
+)
+
+cat(
+  "Melhor BIC:",
+  melhor_bic,
+  "\n"
+)
+
+cat(
+  "Melhor RMSE teste:",
+  melhor_rmse_teste,
+  "\n"
+)
+
+cat(
+  "Contribuicao espacial agregada:",
+  percent(
+    resumo_componentes$pct_espacial_total,
+    accuracy = 0.1
+  ),
+  "\n"
+)
+
+cat("=============================================\n")
+```
+
+# 28. Nota metodológica
+
+O modelo SP-NB utiliza duas fontes de informação distintas.
+
+A primeira é o risco climático contemporâneo da própria grade:
+
+\[
+\exp(
+\beta_0+
+\beta_1X_1+
+\beta_2X_2+
+\beta_3X_3
+).
+\]
+
+A segunda é a atividade espaço-temporal passada:
+
+\[
+\psi_g
+(A\bar Y_{t-1})_g.
+\]
+
+Portanto, o parâmetro \(\psi_g\) mede se a ocorrência recente de shocks nos grids vizinhos acrescenta informação para explicar a frequência atual de desastres após controlar pelas variáveis de precipitação.
+
+A comparação entre NB e SP-NB permite avaliar diretamente o valor incremental dessa estrutura espaço-temporal.
+
+```{r session-info}
+sessionInfo()
+```
