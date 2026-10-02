@@ -1,0 +1,2094 @@
+# ============================================================
+# BASE TRATADA V3
+# Risk Group x Grid x Mes
+#
+# Objetivo:
+#
+# Construir uma base sintetica inspirada no modelo SP-NB:
+#
+# Y_{r,g,t} ~ NB(lambda_{r,g,t}, phi)
+#
+# lambda_{r,g,t}
+# =
+# E_{r,g,t} *
+# [
+#   exp(beta'X_{r,g,t})
+#   +
+#   psi_g * (A Ybar_{t-1})_g
+# ]
+#
+# onde:
+#
+# r = risk group
+# g = grid
+# t = mes
+#
+# IMPORTANTE:
+# Nesta versao,
+#
+# E_{r,g,t} = numero de domicilios segurados
+#
+# Portanto, a taxa baseline e interpretada como
+# sinistros por domicilio segurado por mes.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. PACOTES
+# ------------------------------------------------------------
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+
+
+# ------------------------------------------------------------
+# 1. CONFIGURACOES
+# ------------------------------------------------------------
+
+set.seed(12345)
+
+N_DOMICILIOS <- 15000
+
+ARQUIVO_BASE <-
+  "base_tratada_v2.csv"
+
+ARQUIVO_SAIDA <-
+  "base_tratada_v3.csv"
+
+# Quantil utilizado para classificar shock
+QUANTIL_SHOCK <- 0.80
+
+
+# ------------------------------------------------------------
+# 2. LER BASE V2
+# ------------------------------------------------------------
+
+base_v2 <- read_csv(
+  ARQUIVO_BASE,
+  show_col_types = FALSE
+)
+
+
+# ------------------------------------------------------------
+# 3. VALIDAR COLUNAS NECESSARIAS
+# ------------------------------------------------------------
+
+colunas_necessarias <- c(
+  "id_celula",
+  "linha",
+  "coluna",
+  "ano",
+  "mes",
+  "prec_mensal_soma",
+  "prec_mensal_max",
+  "dias_acima_threshold"
+)
+
+faltantes <- setdiff(
+  colunas_necessarias,
+  names(base_v2)
+)
+
+if (length(faltantes) > 0) {
+
+  stop(
+    paste(
+      "Colunas faltantes:",
+      paste(
+        faltantes,
+        collapse = ", "
+      )
+    )
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# 4. ORGANIZAR BASE CLIMATICA
+# ------------------------------------------------------------
+
+clima <- base_v2 %>%
+
+  dplyr::select(
+    id_celula,
+    linha,
+    coluna,
+    ano,
+    mes,
+    prec_mensal_soma,
+    prec_mensal_max,
+    dias_acima_threshold
+  ) %>%
+
+  dplyr::mutate(
+
+    ano =
+      as.integer(ano),
+
+    mes =
+      as.integer(mes),
+
+    data_mes =
+      as.Date(
+        sprintf(
+          "%04d-%02d-01",
+          ano,
+          mes
+        )
+      )
+
+  ) %>%
+
+  dplyr::arrange(
+    id_celula,
+    data_mes
+  )
+
+
+# ------------------------------------------------------------
+# 5. CRIAR CHUVA DEFASADA EM 1 MES
+# ------------------------------------------------------------
+
+clima <- clima %>%
+
+  dplyr::group_by(
+    id_celula
+  ) %>%
+
+  dplyr::arrange(
+    data_mes,
+    .by_group = TRUE
+  ) %>%
+
+  dplyr::mutate(
+
+    prec_mensal_soma_lag1 =
+      dplyr::lag(
+        prec_mensal_soma,
+        n = 1
+      )
+
+  ) %>%
+
+  dplyr::ungroup()
+
+
+# Primeiro mes nao possui t-1.
+# Para nao gerar NA no processo, usamos o proprio
+# valor contemporaneo somente no primeiro mes de cada grid.
+
+clima <- clima %>%
+
+  dplyr::mutate(
+
+    prec_mensal_soma_lag1 =
+      dplyr::if_else(
+
+        is.na(
+          prec_mensal_soma_lag1
+        ),
+
+        prec_mensal_soma,
+
+        prec_mensal_soma_lag1
+
+      )
+
+  )
+
+
+# ============================================================
+# 6. PADRONIZAR VARIAVEIS CLIMATICAS
+# ============================================================
+
+media_prec <-
+  mean(
+    clima$prec_mensal_soma,
+    na.rm = TRUE
+  )
+
+sd_prec <-
+  sd(
+    clima$prec_mensal_soma,
+    na.rm = TRUE
+  )
+
+
+media_max <-
+  mean(
+    clima$prec_mensal_max,
+    na.rm = TRUE
+  )
+
+sd_max <-
+  sd(
+    clima$prec_mensal_max,
+    na.rm = TRUE
+  )
+
+
+media_extremos <-
+  mean(
+    clima$dias_acima_threshold,
+    na.rm = TRUE
+  )
+
+sd_extremos <-
+  sd(
+    clima$dias_acima_threshold,
+    na.rm = TRUE
+  )
+
+
+media_prec_lag <-
+  mean(
+    clima$prec_mensal_soma_lag1,
+    na.rm = TRUE
+  )
+
+sd_prec_lag <-
+  sd(
+    clima$prec_mensal_soma_lag1,
+    na.rm = TRUE
+  )
+
+
+clima <- clima %>%
+
+  dplyr::mutate(
+
+    z_prec_mensal =
+      (
+        prec_mensal_soma -
+          media_prec
+      ) /
+      sd_prec,
+
+    z_prec_max =
+      (
+        prec_mensal_max -
+          media_max
+      ) /
+      sd_max,
+
+    z_dias_extremos =
+      (
+        dias_acima_threshold -
+          media_extremos
+      ) /
+      sd_extremos,
+
+    z_prec_lag1 =
+      (
+        prec_mensal_soma_lag1 -
+          media_prec_lag
+      ) /
+      sd_prec_lag
+
+  )
+
+
+# ============================================================
+# 7. IDENTIFICAR OS 25 GRIDS
+# ============================================================
+
+grids <- clima %>%
+
+  dplyr::distinct(
+    id_celula,
+    linha,
+    coluna
+  ) %>%
+
+  dplyr::arrange(
+    linha,
+    coluna
+  )
+
+
+if (nrow(grids) != 25) {
+
+  stop(
+    paste(
+      "Esperavamos 25 grids, mas encontramos",
+      nrow(grids)
+    )
+  )
+
+}
+
+
+grid_order <-
+  grids$id_celula
+
+
+# ============================================================
+# 8. DISTRIBUIR 15.000 DOMICILIOS ENTRE OS GRIDS
+# ============================================================
+
+# Criamos pesos positivos levemente heterogeneos.
+# A multinomial garante que o total seja exatamente 15.000.
+
+peso_grid_bruto <- rgamma(
+
+  n =
+    nrow(grids),
+
+  shape =
+    15,
+
+  rate =
+    1
+
+)
+
+
+prob_grid <-
+  peso_grid_bruto /
+  sum(
+    peso_grid_bruto
+  )
+
+
+n_por_grid <- as.numeric(
+
+  rmultinom(
+
+    n = 1,
+
+    size =
+      N_DOMICILIOS,
+
+    prob =
+      prob_grid
+
+  )
+
+)
+
+
+carteira_grid <- grids %>%
+
+  dplyr::mutate(
+
+    prob_grid =
+      prob_grid,
+
+    n_domicilios =
+      n_por_grid
+
+  )
+
+
+cat(
+  "\nTotal de domicilios:",
+  sum(
+    carteira_grid$n_domicilios
+  ),
+  "\n"
+)
+
+
+print(
+  carteira_grid
+)
+
+
+# ============================================================
+# 9. DEFINIR CATEGORIAS DOS RISK GROUPS
+# ============================================================
+
+pisos <- c(
+  "1",
+  "2",
+  "3+"
+)
+
+
+qualidade <- c(
+  "Boa",
+  "Media",
+  "Baixa"
+)
+
+
+idade <- c(
+  "0-10",
+  "11-20",
+  "21-30",
+  "30+"
+)
+
+
+risk_groups <- tidyr::expand_grid(
+
+  pisos =
+    pisos,
+
+  qualidade =
+    qualidade,
+
+  idade_faixa =
+    idade
+
+) %>%
+
+  dplyr::mutate(
+
+    risk_group_id =
+      dplyr::row_number()
+
+  )
+
+
+cat(
+  "\nNumero de risk groups:",
+  nrow(risk_groups),
+  "\n"
+)
+
+
+# ============================================================
+# 10. PROBABILIDADES BASE DAS CARACTERISTICAS
+# ============================================================
+
+prob_pisos <- c(
+
+  "1" =
+    0.55,
+
+  "2" =
+    0.32,
+
+  "3+" =
+    0.13
+
+)
+
+
+prob_qualidade <- c(
+
+  "Boa" =
+    0.30,
+
+  "Media" =
+    0.50,
+
+  "Baixa" =
+    0.20
+
+)
+
+
+prob_idade <- c(
+
+  "0-10" =
+    0.18,
+
+  "11-20" =
+    0.23,
+
+  "21-30" =
+    0.24,
+
+  "30+" =
+    0.35
+
+)
+
+
+# ------------------------------------------------------------
+# Probabilidade conjunta inicial
+# ------------------------------------------------------------
+
+risk_groups <- risk_groups %>%
+
+  dplyr::mutate(
+
+    prob_base =
+
+      prob_pisos[
+        pisos
+      ] *
+
+      prob_qualidade[
+        qualidade
+      ] *
+
+      prob_idade[
+        idade_faixa
+      ]
+
+  )
+
+
+stopifnot(
+  abs(
+    sum(
+      risk_groups$prob_base
+    ) -
+      1
+  ) <
+    1e-10
+)
+
+
+# ============================================================
+# 11. SIMULAR COMPOSICAO DOS RISK GROUPS EM CADA GRID
+# ============================================================
+
+lista_carteira <- vector(
+  "list",
+  nrow(carteira_grid)
+)
+
+
+for (g in seq_len(
+  nrow(carteira_grid)
+)) {
+
+
+  n_grid <-
+    carteira_grid$n_domicilios[g]
+
+
+  # Pequena heterogeneidade entre grids
+
+  ruido <-
+    rgamma(
+
+      n =
+        nrow(risk_groups),
+
+      shape =
+        30,
+
+      rate =
+        30
+
+    )
+
+
+  prob_grupo_grid <-
+
+    risk_groups$prob_base *
+    ruido
+
+
+  prob_grupo_grid <-
+
+    prob_grupo_grid /
+    sum(
+      prob_grupo_grid
+    )
+
+
+  contagens <-
+    as.numeric(
+
+      rmultinom(
+
+        n = 1,
+
+        size =
+          n_grid,
+
+        prob =
+          prob_grupo_grid
+
+      )
+
+    )
+
+
+  lista_carteira[[g]] <-
+
+    risk_groups %>%
+
+    dplyr::mutate(
+
+      id_celula =
+        carteira_grid$id_celula[g],
+
+      linha =
+        carteira_grid$linha[g],
+
+      coluna =
+        carteira_grid$coluna[g],
+
+      n_domicilios =
+        contagens
+
+    ) %>%
+
+    dplyr::filter(
+      n_domicilios > 0
+    )
+
+}
+
+
+carteira_risk_group <-
+
+  dplyr::bind_rows(
+    lista_carteira
+  )
+
+
+# ------------------------------------------------------------
+# Checagem
+# ------------------------------------------------------------
+
+cat(
+  "\nTotal apos distribuicao em risk groups:",
+  sum(
+    carteira_risk_group$n_domicilios
+  ),
+  "\n"
+)
+
+
+stopifnot(
+
+  sum(
+    carteira_risk_group$n_domicilios
+  ) ==
+    N_DOMICILIOS
+
+)
+
+
+# ============================================================
+# 12. CRIAR BASE RISK GROUP x GRID x MES
+# ============================================================
+
+base_v3 <- clima %>%
+
+  dplyr::left_join(
+
+    carteira_risk_group %>%
+
+      dplyr::select(
+
+        id_celula,
+
+        risk_group_id,
+
+        pisos,
+        qualidade,
+        idade_faixa,
+
+        n_domicilios
+
+      ),
+
+    by =
+      "id_celula"
+
+  )
+
+
+# ============================================================
+# 13. EXPOSICAO = NUMERO DE DOMICILIOS SEGURADOS
+# ============================================================
+
+# Esta e a principal mudanca em relacao a versao anterior.
+#
+# A exposicao nao sera anualizada.
+#
+# Exemplo:
+# se um risk group possui 120 casas seguradas naquele mes,
+#
+# exposicao = 120.
+#
+# Logo:
+#
+# lambda / exposicao
+#
+# e interpretado como frequencia esperada mensal de sinistros
+# por domicilio segurado.
+
+base_v3 <- base_v3 %>%
+
+  dplyr::mutate(
+
+    exposicao =
+      as.numeric(
+        n_domicilios
+      )
+
+  )
+
+
+# ------------------------------------------------------------
+# Checagem:
+# cada mes deve possuir exatamente 15.000 exposicoes
+# ------------------------------------------------------------
+
+checagem_exposicao <- base_v3 %>%
+
+  dplyr::group_by(
+    ano,
+    mes
+  ) %>%
+
+  dplyr::summarise(
+
+    exposicao_total =
+      sum(
+        exposicao
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+if (
+  all(
+    checagem_exposicao$exposicao_total ==
+      N_DOMICILIOS
+  )
+) {
+
+  cat(
+    "\nOK: todos os meses possuem exatamente",
+    N_DOMICILIOS,
+    "domicilios segurados de exposicao.\n"
+  )
+
+} else {
+
+  stop(
+    "A exposicao mensal nao soma 15.000 em todos os meses."
+  )
+
+}
+
+
+# ============================================================
+# 14. CRIAR DUMMIES DOS RISK FACTORS
+# ============================================================
+
+# Categorias de referencia:
+#
+# Pisos:
+#   1 piso
+#
+# Qualidade:
+#   Boa
+#
+# Idade:
+#   0-10 anos
+
+base_v3 <- base_v3 %>%
+
+  dplyr::mutate(
+
+    pisos_2 =
+      as.integer(
+        pisos == "2"
+      ),
+
+    pisos_3mais =
+      as.integer(
+        pisos == "3+"
+      ),
+
+
+    qualidade_media =
+      as.integer(
+        qualidade == "Media"
+      ),
+
+    qualidade_baixa =
+      as.integer(
+        qualidade == "Baixa"
+      ),
+
+
+    idade_11_20 =
+      as.integer(
+        idade_faixa == "11-20"
+      ),
+
+    idade_21_30 =
+      as.integer(
+        idade_faixa == "21-30"
+      ),
+
+    idade_30mais =
+      as.integer(
+        idade_faixa == "30+"
+      )
+
+  )
+
+
+# ============================================================
+# 15. CRIAR MATRIZ QUEEN
+# ============================================================
+
+# Queen:
+#
+# duas celulas sao vizinhas se compartilham
+# lado OU vertice.
+#
+# Portanto:
+#
+# abs(delta_linha) <= 1
+# abs(delta_coluna) <= 1
+#
+# excluindo a propria celula.
+
+
+G <-
+  nrow(grids)
+
+
+A_queen <- matrix(
+
+  0,
+
+  nrow =
+    G,
+
+  ncol =
+    G
+
+)
+
+
+for (
+  i in seq_len(G)
+) {
+
+  for (
+    j in seq_len(G)
+  ) {
+
+
+    if (
+      i != j
+    ) {
+
+
+      delta_linha <-
+        abs(
+          grids$linha[i] -
+            grids$linha[j]
+        )
+
+
+      delta_coluna <-
+        abs(
+          grids$coluna[i] -
+            grids$coluna[j]
+        )
+
+
+      if (
+
+        delta_linha <= 1 &&
+        delta_coluna <= 1
+
+      ) {
+
+        A_queen[i, j] <-
+          1
+
+      }
+
+    }
+
+  }
+
+}
+
+
+rownames(
+  A_queen
+) <-
+  grid_order
+
+
+colnames(
+  A_queen
+) <-
+  grid_order
+
+
+# ------------------------------------------------------------
+# Validacoes Queen
+# ------------------------------------------------------------
+
+stopifnot(
+
+  all(
+    diag(
+      A_queen
+    ) == 0
+  )
+
+)
+
+
+stopifnot(
+
+  isTRUE(
+
+    all.equal(
+
+      A_queen,
+
+      t(
+        A_queen
+      )
+
+    )
+
+  )
+
+)
+
+
+cat(
+  "\nPares Queen unicos:",
+  sum(
+    A_queen
+  ) /
+    2,
+  "\n"
+)
+
+
+cat(
+  "\nNumero de vizinhos Queen por grid:\n"
+)
+
+
+print(
+  rowSums(
+    A_queen
+  )
+)
+
+
+# ============================================================
+# 16. PARAMETROS VERDADEIROS DA SIMULACAO
+# ============================================================
+
+# IMPORTANTE:
+#
+# Como agora a exposicao = numero de casas e a taxa e MENSAL,
+# o intercepto precisa representar uma frequencia mensal.
+#
+# log(0.002) significa aproximadamente:
+#
+# 0.2% de frequencia baseline por domicilio por mes.
+#
+# Em 15.000 domicilios isso seria, antes dos demais efeitos:
+#
+# ~30 sinistros esperados por mes.
+#
+# Depois os risk factors, chuva e spatial lag alteram isso.
+
+BETA_TRUE <- c(
+
+  intercepto =
+    log(0.002),
+
+  z_prec_mensal =
+    0.30,
+
+  z_prec_max =
+    0.22,
+
+  z_dias_extremos =
+    0.18,
+
+  z_prec_lag1 =
+    0.12,
+
+  pisos_2 =
+    0.08,
+
+  pisos_3mais =
+    0.20,
+
+  qualidade_media =
+    0.12,
+
+  qualidade_baixa =
+    0.32,
+
+  idade_11_20 =
+    0.06,
+
+  idade_21_30 =
+    0.14,
+
+  idade_30mais =
+    0.28
+
+)
+
+
+# ------------------------------------------------------------
+# Dispersao NB
+# ------------------------------------------------------------
+
+PHI_TRUE <-
+  2.5
+
+
+# ============================================================
+# 17. PSI VERDADEIRO POR GRID
+# ============================================================
+
+# Como a exposicao agora e muito maior numericamente,
+# o psi deve ser pequeno.
+#
+# Caso contrario, o componente espacial multiplicado
+# por centenas de domicilios pode gerar sinistros demais.
+
+psi_true <-
+  runif(
+
+    G,
+
+    min =
+      0.00005,
+
+    max =
+      0.00020
+
+  )
+
+
+names(
+  psi_true
+) <-
+  grid_order
+
+
+# ============================================================
+# 18. PARAMETRO DE REFERENCIA PARA SHOCK
+# ============================================================
+
+# Frequencia mensal de referencia para construir Y_bar.
+#
+# Deve estar na mesma unidade da exposicao:
+#
+# sinistros / domicilio / mes.
+
+LAMBDA_SHOCK_REF <-
+  0.002
+
+
+# ============================================================
+# 19. PREPARAR COLUNAS PARA SIMULACAO
+# ============================================================
+
+base_v3 <- base_v3 %>%
+
+  dplyr::mutate(
+
+    spatial_lag =
+      0,
+
+    taxa_base_true =
+      NA_real_,
+
+    taxa_spatial_true =
+      NA_real_,
+
+    lambda_true =
+      NA_real_,
+
+    sinistros =
+      NA_integer_
+
+  )
+
+
+# ============================================================
+# 20. TABELA GRID-MES PARA Y_AGG E Y_BAR
+# ============================================================
+
+grid_mes <- clima %>%
+
+  dplyr::select(
+
+    id_celula,
+    ano,
+    mes,
+    data_mes
+
+  ) %>%
+
+  dplyr::distinct() %>%
+
+  dplyr::mutate(
+
+    y_agg =
+      0L,
+
+    exposicao_agg =
+      NA_real_,
+
+    lambda_ref_shock =
+      NA_real_,
+
+    threshold_ybar =
+      NA_integer_,
+
+    y_bar =
+      0L,
+
+    spatial_lag =
+      0
+
+  ) %>%
+
+  dplyr::arrange(
+    data_mes,
+    match(
+      id_celula,
+      grid_order
+    )
+  )
+
+
+# ============================================================
+# 21. SIMULACAO SEQUENCIAL NO TEMPO
+# ============================================================
+
+meses <-
+  sort(
+    unique(
+      base_v3$data_mes
+    )
+  )
+
+
+for (
+  tt in seq_along(
+    meses
+  )
+) {
+
+
+  mes_atual <-
+    meses[tt]
+
+
+  # ----------------------------------------------------------
+  # 21.1 Spatial lag vindo do mes anterior
+  # ----------------------------------------------------------
+
+  if (
+    tt == 1
+  ) {
+
+    vetor_spatial <-
+      rep(
+        0,
+        G
+      )
+
+    names(
+      vetor_spatial
+    ) <-
+      grid_order
+
+
+  } else {
+
+
+    mes_anterior <-
+      meses[
+        tt - 1
+      ]
+
+
+    ybar_anterior <-
+      grid_mes %>%
+
+      dplyr::filter(
+        data_mes ==
+          mes_anterior
+      ) %>%
+
+      dplyr::arrange(
+        match(
+          id_celula,
+          grid_order
+        )
+      )
+
+
+    vetor_ybar <-
+      ybar_anterior$y_bar
+
+
+    names(
+      vetor_ybar
+    ) <-
+      ybar_anterior$id_celula
+
+
+    vetor_ybar <-
+      vetor_ybar[
+        grid_order
+      ]
+
+
+    vetor_spatial <-
+      as.numeric(
+        A_queen %*%
+          vetor_ybar
+      )
+
+
+    names(
+      vetor_spatial
+    ) <-
+      grid_order
+
+  }
+
+
+  # ----------------------------------------------------------
+  # 21.2 Selecionar linhas do mes atual
+  # ----------------------------------------------------------
+
+  idx <-
+    which(
+      base_v3$data_mes ==
+        mes_atual
+    )
+
+
+  dados_mes <-
+    base_v3[
+      idx,
+    ]
+
+
+  # Spatial lag do grid correspondente
+
+  S <-
+    vetor_spatial[
+      dados_mes$id_celula
+    ]
+
+
+  # ----------------------------------------------------------
+  # 21.3 Preditor linear verdadeiro
+  # ----------------------------------------------------------
+
+  eta <-
+
+    BETA_TRUE[
+      "intercepto"
+    ] +
+
+    BETA_TRUE[
+      "z_prec_mensal"
+    ] *
+      dados_mes$z_prec_mensal +
+
+    BETA_TRUE[
+      "z_prec_max"
+    ] *
+      dados_mes$z_prec_max +
+
+    BETA_TRUE[
+      "z_dias_extremos"
+    ] *
+      dados_mes$z_dias_extremos +
+
+    BETA_TRUE[
+      "z_prec_lag1"
+    ] *
+      dados_mes$z_prec_lag1 +
+
+    BETA_TRUE[
+      "pisos_2"
+    ] *
+      dados_mes$pisos_2 +
+
+    BETA_TRUE[
+      "pisos_3mais"
+    ] *
+      dados_mes$pisos_3mais +
+
+    BETA_TRUE[
+      "qualidade_media"
+    ] *
+      dados_mes$qualidade_media +
+
+    BETA_TRUE[
+      "qualidade_baixa"
+    ] *
+      dados_mes$qualidade_baixa +
+
+    BETA_TRUE[
+      "idade_11_20"
+    ] *
+      dados_mes$idade_11_20 +
+
+    BETA_TRUE[
+      "idade_21_30"
+    ] *
+      dados_mes$idade_21_30 +
+
+    BETA_TRUE[
+      "idade_30mais"
+    ] *
+      dados_mes$idade_30mais
+
+
+  # ----------------------------------------------------------
+  # 21.4 Risco baseline mensal por domicilio
+  # ----------------------------------------------------------
+
+  taxa_base <-
+    exp(
+      eta
+    )
+
+
+  # ----------------------------------------------------------
+  # 21.5 Componente espacial mensal
+  # ----------------------------------------------------------
+
+  psi_linha <-
+    psi_true[
+      dados_mes$id_celula
+    ]
+
+
+  taxa_spatial <-
+
+    psi_linha *
+    S
+
+
+  # ----------------------------------------------------------
+  # 21.6 Media NB
+  # ----------------------------------------------------------
+
+  lambda <-
+
+    dados_mes$exposicao *
+
+    (
+      taxa_base +
+        taxa_spatial
+    )
+
+
+  lambda <-
+    pmax(
+      lambda,
+      1e-12
+    )
+
+
+  # ----------------------------------------------------------
+  # 21.7 Simular Y
+  # ----------------------------------------------------------
+
+  Y <-
+    rnbinom(
+
+      n =
+        length(lambda),
+
+      mu =
+        lambda,
+
+      size =
+        PHI_TRUE
+
+    )
+
+
+  # ----------------------------------------------------------
+  # 21.8 Gravar resultados
+  # ----------------------------------------------------------
+
+  base_v3$spatial_lag[
+    idx
+  ] <-
+    S
+
+
+  base_v3$taxa_base_true[
+    idx
+  ] <-
+    taxa_base
+
+
+  base_v3$taxa_spatial_true[
+    idx
+  ] <-
+    taxa_spatial
+
+
+  base_v3$lambda_true[
+    idx
+  ] <-
+    lambda
+
+
+  base_v3$sinistros[
+    idx
+  ] <-
+    Y
+
+
+  # ==========================================================
+  # 21.9 AGREGAR Y E EXPOSICAO POR GRID
+  # ==========================================================
+
+  agregado_mes <-
+    base_v3[
+      idx,
+    ] %>%
+
+    dplyr::group_by(
+      id_celula
+    ) %>%
+
+    dplyr::summarise(
+
+      y_agg =
+        sum(
+          sinistros
+        ),
+
+      exposicao_agg =
+        sum(
+          exposicao
+        ),
+
+      .groups =
+        "drop"
+
+    )
+
+
+  # ==========================================================
+  # 21.10 CONSTRUIR Y_BAR
+  # ==========================================================
+
+  agregado_mes <-
+    agregado_mes %>%
+
+    dplyr::mutate(
+
+      lambda_ref_shock =
+
+        LAMBDA_SHOCK_REF *
+        exposicao_agg,
+
+      threshold_ybar =
+
+        qpois(
+
+          QUANTIL_SHOCK,
+
+          lambda =
+            lambda_ref_shock
+
+        ),
+
+      y_bar =
+
+        as.integer(
+
+          y_agg >
+            threshold_ybar
+
+        )
+
+    )
+
+
+  # ==========================================================
+  # 21.11 SALVAR GRID-MES
+  # ==========================================================
+
+  idx_grid_mes <-
+    which(
+      grid_mes$data_mes ==
+        mes_atual
+    )
+
+
+  grid_mes$y_agg[
+    idx_grid_mes
+  ] <-
+    agregado_mes$y_agg[
+      match(
+        grid_mes$id_celula[
+          idx_grid_mes
+        ],
+        agregado_mes$id_celula
+      )
+    ]
+
+
+  grid_mes$exposicao_agg[
+    idx_grid_mes
+  ] <-
+    agregado_mes$exposicao_agg[
+      match(
+        grid_mes$id_celula[
+          idx_grid_mes
+        ],
+        agregado_mes$id_celula
+      )
+    ]
+
+
+  grid_mes$lambda_ref_shock[
+    idx_grid_mes
+  ] <-
+    agregado_mes$lambda_ref_shock[
+      match(
+        grid_mes$id_celula[
+          idx_grid_mes
+        ],
+        agregado_mes$id_celula
+      )
+    ]
+
+
+  grid_mes$threshold_ybar[
+    idx_grid_mes
+  ] <-
+    agregado_mes$threshold_ybar[
+      match(
+        grid_mes$id_celula[
+          idx_grid_mes
+        ],
+        agregado_mes$id_celula
+      )
+    ]
+
+
+  grid_mes$y_bar[
+    idx_grid_mes
+  ] <-
+    agregado_mes$y_bar[
+      match(
+        grid_mes$id_celula[
+          idx_grid_mes
+        ],
+        agregado_mes$id_celula
+      )
+    ]
+
+
+  grid_mes$spatial_lag[
+    idx_grid_mes
+  ] <-
+    vetor_spatial[
+      grid_mes$id_celula[
+        idx_grid_mes
+      ]
+    ]
+
+}
+
+
+# ============================================================
+# 22. CHECAGENS DA SIMULACAO
+# ============================================================
+
+cat(
+  "\n=============================================\n"
+)
+
+cat(
+  "RESUMO DA SIMULACAO\n"
+)
+
+cat(
+  "=============================================\n"
+)
+
+
+cat(
+  "Linhas base V3:",
+  nrow(
+    base_v3
+  ),
+  "\n"
+)
+
+
+cat(
+  "Domicilios segurados por mes:",
+  N_DOMICILIOS,
+  "\n"
+)
+
+
+cat(
+  "Risk groups possiveis:",
+  nrow(
+    risk_groups
+  ),
+  "\n"
+)
+
+
+cat(
+  "Total de sinistros simulados:",
+  sum(
+    base_v3$sinistros
+  ),
+  "\n"
+)
+
+
+cat(
+  "Grid-meses com shock:",
+  sum(
+    grid_mes$y_bar
+  ),
+  "\n"
+)
+
+
+cat(
+  "Media mensal de sinistros:",
+  mean(
+    tapply(
+      base_v3$sinistros,
+      base_v3$data_mes,
+      sum
+    )
+  ),
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# Frequencia mensal media
+# ------------------------------------------------------------
+
+freq_mensal_media <-
+
+  sum(
+    base_v3$sinistros
+  ) /
+
+  sum(
+    base_v3$exposicao
+  )
+
+
+cat(
+  "Frequencia media mensal por domicilio:",
+  freq_mensal_media,
+  "\n"
+)
+
+
+cat(
+  "Frequencia anualizada aproximada:",
+  freq_mensal_media * 12,
+  "\n"
+)
+
+
+cat(
+  "=============================================\n"
+)
+
+
+# ============================================================
+# 23. DISTRIBUICAO DE SINISTROS
+# ============================================================
+
+cat(
+  "\nDistribuicao de Y por risk-group-mes:\n"
+)
+
+
+print(
+
+  table(
+    base_v3$sinistros
+  )
+
+)
+
+
+# ============================================================
+# 24. DISTRIBUICAO DE Y_BAR
+# ============================================================
+
+cat(
+  "\nDistribuicao de Y_bar:\n"
+)
+
+
+print(
+
+  table(
+    grid_mes$y_bar
+  )
+
+)
+
+
+# ============================================================
+# 25. RESUMO DA CARTEIRA
+# ============================================================
+
+resumo_carteira <- carteira_risk_group %>%
+
+  dplyr::group_by(
+
+    pisos,
+    qualidade,
+    idade_faixa
+
+  ) %>%
+
+  dplyr::summarise(
+
+    n_domicilios =
+      sum(
+        n_domicilios
+      ),
+
+    .groups =
+      "drop"
+
+  ) %>%
+
+  dplyr::mutate(
+
+    pct_carteira =
+      n_domicilios /
+      sum(
+        n_domicilios
+      )
+
+  )
+
+
+print(
+  resumo_carteira,
+  n = Inf
+)
+
+
+# ============================================================
+# 26. SALVAR MATRIZ QUEEN
+# ============================================================
+
+A_queen_csv <-
+  as.data.frame(
+    A_queen
+  )
+
+
+A_queen_csv <-
+  tibble::rownames_to_column(
+
+    A_queen_csv,
+
+    var =
+      "id_celula"
+
+  )
+
+
+write_csv(
+
+  A_queen_csv,
+
+  "matriz_adjacencia_queen.csv"
+
+)
+
+
+# ============================================================
+# 27. SALVAR PARAMETROS VERDADEIROS
+# ============================================================
+
+parametros_beta_true <- tibble(
+
+  parametro =
+    names(
+      BETA_TRUE
+    ),
+
+  valor_true =
+    as.numeric(
+      BETA_TRUE
+    )
+
+)
+
+
+write_csv(
+
+  parametros_beta_true,
+
+  "parametros_beta_true.csv"
+
+)
+
+
+parametros_psi_true <- tibble(
+
+  id_celula =
+    names(
+      psi_true
+    ),
+
+  psi_true =
+    as.numeric(
+      psi_true
+    )
+
+)
+
+
+write_csv(
+
+  parametros_psi_true,
+
+  "parametros_psi_true.csv"
+
+)
+
+
+parametros_gerais <- tibble(
+
+  parametro =
+    c(
+      "PHI_TRUE",
+      "LAMBDA_SHOCK_REF",
+      "QUANTIL_SHOCK",
+      "N_DOMICILIOS"
+    ),
+
+  valor =
+    c(
+      PHI_TRUE,
+      LAMBDA_SHOCK_REF,
+      QUANTIL_SHOCK,
+      N_DOMICILIOS
+    )
+
+)
+
+
+write_csv(
+
+  parametros_gerais,
+
+  "parametros_gerais_true.csv"
+
+)
+
+
+# ============================================================
+# 28. SALVAR TABELA GRID-MES ESPACIAL
+# ============================================================
+
+write_csv(
+
+  grid_mes,
+
+  "grid_mes_ybar_v3.csv"
+
+)
+
+
+# ============================================================
+# 29. SALVAR CARTEIRA POR RISK GROUP
+# ============================================================
+
+write_csv(
+
+  carteira_risk_group,
+
+  "carteira_risk_groups_v3.csv"
+
+)
+
+
+# ============================================================
+# 30. ORGANIZAR BASE V3
+# ============================================================
+
+base_v3 <- base_v3 %>%
+
+  dplyr::select(
+
+    # Identificacao
+    risk_group_id,
+    id_celula,
+    linha,
+    coluna,
+    ano,
+    mes,
+    data_mes,
+
+    # Portfolio
+    pisos,
+    qualidade,
+    idade_faixa,
+    n_domicilios,
+
+    # Exposicao
+    exposicao,
+
+    # CHIRPS
+    prec_mensal_soma,
+    prec_mensal_max,
+    dias_acima_threshold,
+    prec_mensal_soma_lag1,
+
+    # CHIRPS padronizado
+    z_prec_mensal,
+    z_prec_max,
+    z_dias_extremos,
+    z_prec_lag1,
+
+    # Dummies
+    pisos_2,
+    pisos_3mais,
+
+    qualidade_media,
+    qualidade_baixa,
+
+    idade_11_20,
+    idade_21_30,
+    idade_30mais,
+
+    # Componente espacial
+    spatial_lag,
+
+    # Processo gerador verdadeiro
+    taxa_base_true,
+    taxa_spatial_true,
+    lambda_true,
+
+    # Resposta
+    sinistros
+
+  ) %>%
+
+  dplyr::arrange(
+
+    data_mes,
+    id_celula,
+    risk_group_id
+
+  )
+
+
+# ============================================================
+# 31. SALVAR BASE TRATADA V3
+# ============================================================
+
+write_csv(
+
+  base_v3,
+
+  ARQUIVO_SAIDA
+
+)
+
+
+# ============================================================
+# 32. CHECAGEM FINAL
+# ============================================================
+
+checagem_final <- base_v3 %>%
+
+  dplyr::group_by(
+    ano,
+    mes
+  ) %>%
+
+  dplyr::summarise(
+
+    exposicao_total =
+      sum(exposicao),
+
+    sinistros_total =
+      sum(sinistros),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\nResumo da exposicao mensal:\n"
+)
+
+
+print(
+  summary(
+    checagem_final$exposicao_total
+  )
+)
+
+
+cat(
+  "\nArquivos gerados:\n"
+)
+
+cat(
+  "- base_tratada_v3.csv\n"
+)
+
+cat(
+  "- matriz_adjacencia_queen.csv\n"
+)
+
+cat(
+  "- grid_mes_ybar_v3.csv\n"
+)
+
+cat(
+  "- carteira_risk_groups_v3.csv\n"
+)
+
+cat(
+  "- parametros_beta_true.csv\n"
+)
+
+cat(
+  "- parametros_psi_true.csv\n"
+)
+
+cat(
+  "- parametros_gerais_true.csv\n"
+)
+
+cat(
+  "\nDiretorio:\n",
+  getwd(),
+  "\n"
+)
