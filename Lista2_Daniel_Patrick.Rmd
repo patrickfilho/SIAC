@@ -1,0 +1,179 @@
+---
+title: "Lista 2"
+author: "Daniel Juliace e Patrick Oliveira"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Questão 1
+
+Queremos calcular a integral
+
+$$I = \int_{-\infty}^{\infty} \frac{1}{1+\theta^2} e^{-(2-\theta)^2/2} \, d\theta.$$
+
+Antes de começar, vamos definir o integrando $h(\theta)$ como uma função no R.
+
+```{r q1-funcao}
+
+h = function(theta){
+  (1/(1 + theta^2)) * exp(-(2 - theta)^2/2)
+}
+
+```
+
+# Questão 1 - a
+
+Construção do gráfico do integrando.
+
+```{r q1a}
+
+curve(h(x), from = -6, to = 10, n = 1000, lwd = 2,
+      xlab = expression(theta), ylab = expression(h(theta)),
+      main = "Integrando")
+abline(h = 0, lty = 2, col = "gray")
+
+```
+
+O integrando é praticamente zero fora do intervalo $(-4, 8)$ e tem o seu máximo próximo de $\theta = 2$ (centro do núcleo normal), com a curva deslocada levemente para a esquerda devido ao fator $1/(1+\theta^2)$, que é decrescente para $\theta > 0$. Como as caudas decaem na velocidade de uma normal, é seguro truncar o intervalo de integração numérica sem perder precisão.
+
+# Questão 1 - b
+
+Para a regra dos trapézios, vamos substituir a reta real por um intervalo finito $[a, b]$. Como o termo $e^{-(2-\theta)^2/2}$ decai muito rápido e $1/(1+\theta^2) \leq 1$, a contribuição fora de $[-10, 14]$ é desprezível (nesses extremos temos $h \approx e^{-72}$).
+
+Vamos usar uma grade com espaçamento $0.001$ entre $-10$ e $14$, o que resulta em $24001$ pontos.
+
+```{r q1b}
+
+a = -10
+b = 14
+passo = 0.001
+
+grade = seq(a, b, by = passo)
+length(grade)
+
+valores = h(grade)
+
+# Regra dos trapézios composta
+I_trapezio = passo * (sum(valores) - (valores[1] + valores[length(valores)])/2)
+I_trapezio
+
+# Conferindo com a função integrate do R
+integrate(h, lower = -Inf, upper = Inf)
+
+```
+
+A regra dos trapézios, com grade em $[-10, 14]$ com $24001$ pontos, fornece a estimativa acima para $I$, que concorda com o valor obtido por `integrate` em várias casas decimais.
+
+# Questão 1 - c
+
+Para a integração de Monte Carlo com função de importância, vamos usar a Cauchy padrão como $q(\theta)$. Note que
+
+$$\frac{h(\theta)}{q(\theta)} = \frac{\frac{1}{1+\theta^2} e^{-(2-\theta)^2/2}}{\frac{1}{\pi(1+\theta^2)}} = \pi \, e^{-(2-\theta)^2/2},$$
+
+ou seja, o estimador de Monte Carlo fica
+
+$$\hat{I} = \frac{1}{n}\sum_{i=1}^{n} \pi \, e^{-(2-\theta_i)^2/2}, \quad \theta_i \overset{iid}{\sim} \text{Cauchy}(0,1).$$
+
+Como não foi estipulado o número de amostras, vamos fixar $n = 10000$.
+
+```{r q1c}
+
+set.seed(1807)
+
+n = 10000
+
+# i) amostramos da proposta Cauchy padrão
+theta_cauchy = rcauchy(n)
+
+# ii) calculamos h(theta)/q(theta) em cada ponto
+w_cauchy = h(theta_cauchy) / dcauchy(theta_cauchy)
+
+# iii) estimativa de Monte Carlo
+I_cauchy = mean(w_cauchy)
+I_cauchy
+
+```
+
+Utilizamos $n = 10000$ amostras de Monte Carlo. Note que a razão $h/q$ é limitada (menor ou igual a $\pi$), o que garante variância finita para o estimador.
+
+# Questão 1 - d
+
+Seguindo os slides, a estimativa do erro de Monte Carlo (variância estimada do estimador) é
+
+$$v_n = \frac{1}{n^2}\sum_{i=1}^{n}\left(\frac{h(\theta_i)}{q(\theta_i)} - \hat{I}\right)^2,$$
+
+e o erro-padrão é $\sqrt{v_n}$.
+
+```{r q1d}
+
+v_cauchy = sum((w_cauchy - I_cauchy)^2) / n^2
+ep_cauchy = sqrt(v_cauchy)
+ep_cauchy
+
+# Intervalo de confiança aproximado de 95% (aproximação normal para n grande)
+c(I_cauchy - 1.96*ep_cauchy, I_cauchy + 1.96*ep_cauchy)
+
+```
+
+O erro-padrão estimado é pequeno em relação à estimativa, e o intervalo de confiança aproximado contém o valor obtido pela regra dos trapézios.
+
+# Questão 1 - e
+
+Agora vamos repetir o experimento usando a distribuição normal como função de importância, com o mesmo número de amostras ($n = 10000$). Como o núcleo normal do integrando é centrado em 2, vamos usar a $N(2, 1)$ como proposta. Com isso,
+
+$$\frac{h(\theta)}{q(\theta)} = \frac{\frac{1}{1+\theta^2} e^{-(2-\theta)^2/2}}{\frac{1}{\sqrt{2\pi}} e^{-(2-\theta)^2/2}} = \frac{\sqrt{2\pi}}{1+\theta^2}.$$
+
+```{r q1e}
+
+set.seed(1807)
+
+n = 10000
+
+theta_normal = rnorm(n, mean = 2, sd = 1)
+
+w_normal = h(theta_normal) / dnorm(theta_normal, mean = 2, sd = 1)
+
+I_normal = mean(w_normal)
+I_normal
+
+v_normal = sum((w_normal - I_normal)^2) / n^2
+ep_normal = sqrt(v_normal)
+ep_normal
+
+```
+
+Para comparar as duas abordagens (mesmo $n$):
+
+```{r q1e-comparacao}
+
+comparacao = data.frame(
+  Metodo = c("Trapézio", "MC - Cauchy(0,1)", "MC - Normal(2,1)"),
+  Estimativa = c(I_trapezio, I_cauchy, I_normal),
+  Erro_padrao = c(NA, ep_cauchy, ep_normal)
+)
+comparacao
+
+# Razão entre as variâncias estimadas
+v_cauchy / v_normal
+
+```
+
+```{r q1e-grafico}
+
+# Comparando as propostas com o integrando (normalizado só para visualização)
+curve(h(x), from = -8, to = 10, n = 1000, lwd = 2, ylim = c(0, 0.6),
+      xlab = expression(theta), ylab = "Densidade",
+      main = "Integrando e propostas")
+curve(dcauchy(x), add = TRUE, col = "red", lty = 2, lwd = 2)
+curve(dnorm(x, mean = 2, sd = 1), add = TRUE, col = "blue", lty = 2, lwd = 2)
+legend("topleft", legend = c("h(theta)", "Cauchy(0,1)", "N(2,1)"),
+       col = c("black", "red", "blue"), lty = c(1, 2, 2), lwd = 2, bty = "n")
+
+```
+
+Os dois estimadores de Monte Carlo concordam com o valor obtido pela regra dos trapézios. Porém, com o mesmo número de amostras, a abordagem com a normal $N(2,1)$ apresenta um erro-padrão menor. O motivo é que a $N(2,1)$ reproduz exatamente o núcleo normal do integrando, restando apenas o fator $\sqrt{2\pi}/(1+\theta^2)$, que varia pouco na região em que a proposta concentra massa. Já a Cauchy coloca muita massa nas caudas, onde o integrando é praticamente zero, de modo que parte das amostras é desperdiçada (a razão $h/q$ assume valores próximos de $0$ para elas e valores próximos de $\pi e^{-(2-\theta)^2/2}$ perto de $\theta = 2$, produzindo mais variabilidade).
