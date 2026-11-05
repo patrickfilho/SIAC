@@ -1,0 +1,3749 @@
+---
+title: "Comparação de Modelos de Sinistros"
+subtitle: "Negative Binomial vs Random Forest vs SP-NB Queen"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+
+# ============================================================
+# 0. CONFIGURACOES GERAIS
+# ============================================================
+
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+
+dir.create(
+  "figures_modelos",
+  showWarnings = FALSE
+)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 5.5,
+  fig.path = "figures_modelos/"
+)
+
+# ------------------------------------------------------------
+# Pacotes
+# ------------------------------------------------------------
+
+pacotes <- c(
+  "dplyr",
+  "tidyr",
+  "readr",
+  "tibble",
+  "ggplot2",
+  "knitr",
+  "scales",
+  "MASS",
+  "randomForest"
+)
+
+instalar <- pacotes[
+  !pacotes %in%
+    rownames(
+      installed.packages()
+    )
+]
+
+if (length(instalar) > 0) {
+  install.packages(instalar)
+}
+
+# Nao carregar MASS via library(MASS)
+# para evitar conflito com dplyr::select()
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(randomForest)
+
+# ------------------------------------------------------------
+# Parametros
+# ------------------------------------------------------------
+
+set.seed(12345)
+
+TRAIN_END_YEAR <- 2020
+
+MAX_ITER_EM <- 400
+
+TOL_EM <- 1e-6
+
+EPS <- 1e-12
+```
+
+# 1. Objetivo
+
+O objetivo é comparar três abordagens para prever o número mensal de sinistros em cada grid:
+
+1. **Negative Binomial (NB)**;
+2. **Random Forest (RF)**;
+3. **Spatio-Temporal Negative Binomial com adjacência Queen (SP-NB Queen)**.
+
+A unidade observacional é:
+
+\[
+\boxed{
+\text{grid} \times \text{mês}
+}
+\]
+
+A variável resposta é:
+
+\[
+Y_{g,t}
+=
+\text{número de sinistros no grid }g
+\text{ no mês }t.
+\]
+
+A exposição é:
+
+\[
+E_{g,t}
+=
+\text{número de domicílios segurados no grid}.
+\]
+
+O benchmark Negative Binomial utiliza:
+
+\[
+\lambda_{g,t}
+=
+E_{g,t}
+\exp(\beta^\top X_{g,t}).
+\]
+
+O modelo espaço-temporal utiliza:
+
+\[
+\lambda_{g,t}
+=
+E_{g,t}
+\left[
+\exp(\beta^\top X_{g,t})
++
+\psi_g
+(A_Q\bar Y_{t-1})_g
+\right].
+\]
+
+# 2. Leitura e validação da base
+
+```{r leitura, include=FALSE}
+
+# ============================================================
+# 2. LEITURA
+# ============================================================
+
+ARQUIVO_BASE <- "base_tratada_v4.csv"
+
+if (!file.exists(ARQUIVO_BASE)) {
+
+  stop(
+    paste(
+      "Arquivo nao encontrado:",
+      ARQUIVO_BASE
+    )
+  )
+
+}
+
+base <- readr::read_csv(
+  ARQUIVO_BASE,
+  show_col_types = FALSE
+)
+
+base <- base %>%
+
+  dplyr::mutate(
+
+    id_celula =
+      as.character(id_celula),
+
+    linha =
+      as.integer(linha),
+
+    coluna =
+      as.integer(coluna),
+
+    ano =
+      as.integer(ano),
+
+    mes =
+      as.integer(mes),
+
+    data_mes =
+      as.Date(data_mes),
+
+    sinistros =
+      as.numeric(sinistros),
+
+    exposicao =
+      as.numeric(exposicao),
+
+    y_bar =
+      as.integer(y_bar)
+
+  )
+
+
+# ------------------------------------------------------------
+# Colunas necessarias
+# ------------------------------------------------------------
+
+colunas_necessarias <- c(
+
+  "id_celula",
+  "linha",
+  "coluna",
+  "ano",
+  "mes",
+  "data_mes",
+
+  "exposicao",
+  "sinistros",
+  "y_bar",
+
+  "z_prec_mensal",
+  "z_prec_max",
+  "z_dias_extremos",
+  "z_prec_lag1",
+
+  "z_pct_pisos_2",
+  "z_pct_pisos_3mais",
+
+  "z_pct_qualidade_media",
+  "z_pct_qualidade_baixa",
+
+  "z_pct_idade_11_20",
+  "z_pct_idade_21_30",
+  "z_pct_idade_30mais"
+
+)
+
+faltantes <- setdiff(
+  colunas_necessarias,
+  names(base)
+)
+
+if (length(faltantes) > 0) {
+
+  stop(
+    paste(
+      "Colunas faltantes:",
+      paste(
+        faltantes,
+        collapse = ", "
+      )
+    )
+  )
+
+}
+
+
+# ------------------------------------------------------------
+# Uma linha por grid-mes
+# ------------------------------------------------------------
+
+checagem <- base %>%
+
+  dplyr::count(
+    id_celula,
+    ano,
+    mes
+  )
+
+if (
+  max(
+    checagem$n
+  ) != 1
+) {
+
+  stop(
+    "A base nao possui exatamente uma linha por grid-mes."
+  )
+
+}
+```
+
+```{r resumo-base}
+
+# ============================================================
+# RESUMO DA BASE
+# ============================================================
+
+resumo_base <- tibble::tibble(
+
+  Indicador =
+    c(
+      "Observações",
+      "Grids",
+      "Meses",
+      "Sinistros totais",
+      "Exposição média mensal"
+    ),
+
+  Valor =
+    c(
+
+      nrow(base),
+
+      dplyr::n_distinct(
+        base$id_celula
+      ),
+
+      dplyr::n_distinct(
+        base$data_mes
+      ),
+
+      sum(
+        base$sinistros
+      ),
+
+      base %>%
+
+        dplyr::group_by(
+          ano,
+          mes
+        ) %>%
+
+        dplyr::summarise(
+
+          E =
+            sum(
+              exposicao
+            ),
+
+          .groups =
+            "drop"
+
+        ) %>%
+
+        dplyr::pull(E) %>%
+
+        mean()
+
+    )
+
+)
+
+
+knitr::kable(
+
+  resumo_base,
+
+  digits = 2,
+
+  caption =
+    "Resumo da base utilizada"
+
+)
+```
+
+# 3. Divisão temporal entre treino e teste
+
+```{r split, include=FALSE}
+
+# ============================================================
+# 3. TRAIN / TEST
+# ============================================================
+
+base <- base %>%
+
+  dplyr::mutate(
+
+    amostra =
+      dplyr::if_else(
+
+        ano <=
+          TRAIN_END_YEAR,
+
+        "Treino",
+
+        "Teste"
+
+      )
+
+  )
+
+
+treino <- base %>%
+
+  dplyr::filter(
+    amostra ==
+      "Treino"
+  )
+
+
+teste <- base %>%
+
+  dplyr::filter(
+    amostra ==
+      "Teste"
+  )
+```
+
+```{r tabela-split}
+
+split_resumo <- tibble::tibble(
+
+  Amostra =
+    c(
+      "Treino",
+      "Teste"
+    ),
+
+  Periodo =
+    c(
+
+      paste0(
+        min(treino$ano),
+        "-",
+        max(treino$ano)
+      ),
+
+      paste0(
+        min(teste$ano),
+        "-",
+        max(teste$ano)
+      )
+
+    ),
+
+  Observacoes =
+    c(
+      nrow(treino),
+      nrow(teste)
+    ),
+
+  Sinistros =
+    c(
+      sum(treino$sinistros),
+      sum(teste$sinistros)
+    )
+
+)
+
+
+knitr::kable(
+
+  split_resumo,
+
+  caption =
+    "Divisão temporal da amostra"
+
+)
+```
+
+# 4. Modelo 1 — Negative Binomial
+
+```{r nb, include=FALSE}
+
+# ============================================================
+# 4. NEGATIVE BINOMIAL
+# ============================================================
+
+fit_nb <- MASS::glm.nb(
+
+  sinistros ~
+
+    z_prec_mensal +
+    z_prec_max +
+    z_dias_extremos +
+    z_prec_lag1 +
+
+    z_pct_pisos_2 +
+    z_pct_pisos_3mais +
+
+    z_pct_qualidade_media +
+    z_pct_qualidade_baixa +
+
+    z_pct_idade_11_20 +
+    z_pct_idade_21_30 +
+    z_pct_idade_30mais +
+
+    offset(
+      log(
+        exposicao
+      )
+    ),
+
+  data =
+    treino,
+
+  link =
+    log
+
+)
+
+
+phi_nb <-
+  fit_nb$theta
+
+
+pred_nb_train <-
+  as.numeric(
+
+    predict(
+
+      fit_nb,
+
+      newdata =
+        treino,
+
+      type =
+        "response"
+
+    )
+
+  )
+
+
+pred_nb_test <-
+  as.numeric(
+
+    predict(
+
+      fit_nb,
+
+      newdata =
+        teste,
+
+      type =
+        "response"
+
+    )
+
+  )
+```
+
+# 5. Modelo 2 — Random Forest
+
+O Random Forest é utilizado como benchmark de machine learning para capturar relações não lineares e interações entre as covariáveis.
+
+```{r rf, include=FALSE}
+
+# ============================================================
+# 5. RANDOM FOREST
+# ============================================================
+
+vars_rf <- c(
+
+  "z_prec_mensal",
+  "z_prec_max",
+  "z_dias_extremos",
+  "z_prec_lag1",
+
+  "z_pct_pisos_2",
+  "z_pct_pisos_3mais",
+
+  "z_pct_qualidade_media",
+  "z_pct_qualidade_baixa",
+
+  "z_pct_idade_11_20",
+  "z_pct_idade_21_30",
+  "z_pct_idade_30mais",
+
+  "exposicao"
+
+)
+
+
+formula_rf <- as.formula(
+
+  paste(
+
+    "sinistros ~",
+
+    paste(
+      vars_rf,
+      collapse = " + "
+    )
+
+  )
+
+)
+
+
+fit_rf <- randomForest::randomForest(
+
+  formula_rf,
+
+  data =
+    treino,
+
+  ntree =
+    500,
+
+  mtry =
+    max(
+
+      1,
+
+      floor(
+
+        sqrt(
+          length(
+            vars_rf
+          )
+        )
+
+      )
+
+    ),
+
+  importance =
+    TRUE
+
+)
+
+
+pred_rf_train <-
+  as.numeric(
+
+    predict(
+
+      fit_rf,
+
+      newdata =
+        treino
+
+    )
+
+  )
+
+
+pred_rf_test <-
+  as.numeric(
+
+    predict(
+
+      fit_rf,
+
+      newdata =
+        teste
+
+    )
+
+  )
+
+
+# Nao permitir previsoes negativas
+
+pred_rf_train <-
+  pmax(
+    pred_rf_train,
+    0
+  )
+
+
+pred_rf_test <-
+  pmax(
+    pred_rf_test,
+    0
+  )
+```
+
+# 6. Construção da matriz Queen
+
+```{r queen, include=FALSE}
+
+# ============================================================
+# 6. MATRIZ QUEEN
+# ============================================================
+
+grids <- base %>%
+
+  dplyr::distinct(
+    id_celula,
+    linha,
+    coluna
+  ) %>%
+
+  dplyr::arrange(
+    linha,
+    coluna
+  )
+
+
+grid_order <-
+  grids$id_celula
+
+
+G <-
+  nrow(
+    grids
+  )
+
+
+if (G != 25) {
+
+  stop(
+    paste(
+      "Esperavamos 25 grids, mas encontramos",
+      G
+    )
+  )
+
+}
+
+
+A_queen <- matrix(
+
+  0,
+
+  nrow =
+    G,
+
+  ncol =
+    G
+
+)
+
+
+for (
+  i in seq_len(G)
+) {
+
+  for (
+    j in seq_len(G)
+  ) {
+
+
+    if (
+      i != j
+    ) {
+
+
+      dl <-
+        abs(
+          grids$linha[i] -
+            grids$linha[j]
+        )
+
+
+      dc <-
+        abs(
+          grids$coluna[i] -
+            grids$coluna[j]
+        )
+
+
+      if (
+
+        dl <= 1 &&
+        dc <= 1
+
+      ) {
+
+        A_queen[i, j] <-
+          1
+
+      }
+
+    }
+
+  }
+
+}
+
+
+rownames(
+  A_queen
+) <-
+  grid_order
+
+
+colnames(
+  A_queen
+) <-
+  grid_order
+
+
+stopifnot(
+
+  all(
+    diag(
+      A_queen
+    ) == 0
+  ),
+
+  isTRUE(
+
+    all.equal(
+
+      A_queen,
+
+      t(
+        A_queen
+      )
+
+    )
+
+  )
+
+)
+```
+
+# 7. Componente espaço-temporal
+
+```{r spatial-lag, include=FALSE}
+
+# ============================================================
+# 7. CALCULO DE A * YBAR(t-1)
+# ============================================================
+
+calcular_spatial_lag <- function(
+    dados,
+    A,
+    grid_order
+) {
+
+
+  resultado <- dados %>%
+
+    dplyr::arrange(
+
+      data_mes,
+
+      match(
+        id_celula,
+        grid_order
+      )
+
+    )
+
+
+  resultado$spatial_lag_modelo <-
+    0
+
+
+  meses <-
+    sort(
+      unique(
+        resultado$data_mes
+      )
+    )
+
+
+  if (
+    length(
+      meses
+    ) >
+      1
+  ) {
+
+
+    for (
+      tt in 2:length(
+        meses
+      )
+    ) {
+
+
+      mes_anterior <-
+        meses[
+          tt - 1
+        ]
+
+
+      mes_atual <-
+        meses[
+          tt
+        ]
+
+
+      anterior <- resultado %>%
+
+        dplyr::filter(
+          data_mes ==
+            mes_anterior
+        )
+
+
+      vetor_ybar <- rep(
+
+        0,
+
+        length(
+          grid_order
+        )
+
+      )
+
+
+      names(
+        vetor_ybar
+      ) <-
+        grid_order
+
+
+      vetor_ybar[
+        anterior$id_celula
+      ] <-
+        anterior$y_bar
+
+
+      S <-
+
+        as.numeric(
+
+          A %*%
+            vetor_ybar
+
+        )
+
+
+      names(
+        S
+      ) <-
+        grid_order
+
+
+      idx <-
+        which(
+          resultado$data_mes ==
+            mes_atual
+        )
+
+
+      resultado$spatial_lag_modelo[
+        idx
+      ] <-
+
+        S[
+          resultado$id_celula[
+            idx
+          ]
+        ]
+
+    }
+
+  }
+
+
+  resultado
+}
+
+
+base_sp <- calcular_spatial_lag(
+
+  dados =
+    base,
+
+  A =
+    A_queen,
+
+  grid_order =
+    grid_order
+
+)
+
+
+treino_sp <- base_sp %>%
+
+  dplyr::filter(
+    ano <=
+      TRAIN_END_YEAR
+  )
+
+
+teste_sp <- base_sp %>%
+
+  dplyr::filter(
+    ano >
+      TRAIN_END_YEAR
+  )
+```
+
+# 8. Matriz de covariáveis do SP-NB
+
+```{r spnb-matriz, include=FALSE}
+
+# ============================================================
+# 8. MATRIZ X
+# ============================================================
+
+criar_X <- function(
+    dados
+) {
+
+
+  cbind(
+
+    Intercepto =
+      1,
+
+
+    z_prec_mensal =
+      dados$z_prec_mensal,
+
+
+    z_prec_max =
+      dados$z_prec_max,
+
+
+    z_dias_extremos =
+      dados$z_dias_extremos,
+
+
+    z_prec_lag1 =
+      dados$z_prec_lag1,
+
+
+    z_pct_pisos_2 =
+      dados$z_pct_pisos_2,
+
+
+    z_pct_pisos_3mais =
+      dados$z_pct_pisos_3mais,
+
+
+    z_pct_qualidade_media =
+      dados$z_pct_qualidade_media,
+
+
+    z_pct_qualidade_baixa =
+      dados$z_pct_qualidade_baixa,
+
+
+    z_pct_idade_11_20 =
+      dados$z_pct_idade_11_20,
+
+
+    z_pct_idade_21_30 =
+      dados$z_pct_idade_21_30,
+
+
+    z_pct_idade_30mais =
+      dados$z_pct_idade_30mais
+
+  )
+
+}
+
+
+X_train <-
+  criar_X(
+    treino_sp
+  )
+
+
+X_test <-
+  criar_X(
+    teste_sp
+  )
+
+
+Y_train <-
+  treino_sp$sinistros
+
+
+Y_test <-
+  teste_sp$sinistros
+
+
+E_train <-
+  treino_sp$exposicao
+
+
+E_test <-
+  teste_sp$exposicao
+
+
+S_train <-
+  treino_sp$spatial_lag_modelo
+
+
+S_test <-
+  teste_sp$spatial_lag_modelo
+
+
+grid_idx_train <-
+
+  match(
+
+    treino_sp$id_celula,
+
+    grid_order
+
+  )
+
+
+grid_idx_test <-
+
+  match(
+
+    teste_sp$id_celula,
+
+    grid_order
+
+  )
+
+
+if (
+
+  any(
+    is.na(
+      grid_idx_train
+    )
+  ) ||
+
+  any(
+    is.na(
+      grid_idx_test
+    )
+  )
+
+) {
+
+  stop(
+    "Existem grids sem correspondencia."
+  )
+
+}
+```
+
+# 9. Funções do SP-NB Queen
+
+```{r spnb-funcoes, include=FALSE}
+
+# ============================================================
+# 9. FUNCOES SP-NB
+# ============================================================
+
+calcular_mu_spnb <- function(
+    beta,
+    gamma_psi,
+    X,
+    E,
+    S,
+    grid_idx
+) {
+
+
+  eta <-
+
+    as.numeric(
+
+      X %*%
+        beta
+
+    )
+
+
+  taxa_base <-
+
+    exp(
+
+      pmin(
+        eta,
+        30
+      )
+
+    )
+
+
+  psi <-
+
+    exp(
+      gamma_psi
+    )
+
+
+  taxa_spatial <-
+
+    psi[
+      grid_idx
+    ] *
+    S
+
+
+  mu <-
+
+    E *
+
+    (
+      taxa_base +
+        taxa_spatial
+    )
+
+
+  pmax(
+    mu,
+    EPS
+  )
+
+}
+
+
+loglik_nb <- function(
+    y,
+    mu,
+    phi
+) {
+
+
+  sum(
+
+    dnbinom(
+
+      y,
+
+      mu =
+        mu,
+
+      size =
+        phi,
+
+      log =
+        TRUE
+
+    )
+
+  )
+
+}
+```
+
+# 10. Algoritmo EM
+
+```{r spnb-em, include=FALSE}
+
+# ============================================================
+# 10. ALGORITMO EM
+# ============================================================
+
+fit_spnb_em <- function(
+    y,
+    X,
+    E,
+    S,
+    grid_idx,
+    n_grids,
+    beta_init,
+    phi_init,
+    max_iter = 400,
+    tol = 1e-6
+) {
+
+
+  p <-
+    ncol(
+      X
+    )
+
+
+  beta <-
+    beta_init
+
+
+  phi <-
+
+    max(
+      phi_init,
+      0.01
+    )
+
+
+  gamma_psi <- rep(
+
+    log(
+      1e-4
+    ),
+
+    n_grids
+
+  )
+
+
+  ll_anterior <-
+    -Inf
+
+
+  convergiu <-
+    FALSE
+
+
+  historico <-
+    tibble::tibble()
+
+
+  for (
+    iter in seq_len(
+      max_iter
+    )
+  ) {
+
+
+    # --------------------------------------------------------
+    # MU ATUAL
+    # --------------------------------------------------------
+
+    mu <-
+
+      calcular_mu_spnb(
+
+        beta =
+          beta,
+
+        gamma_psi =
+          gamma_psi,
+
+        X =
+          X,
+
+        E =
+          E,
+
+        S =
+          S,
+
+        grid_idx =
+          grid_idx
+
+      )
+
+
+    # ========================================================
+    # E STEP
+    # ========================================================
+
+    w1 <-
+
+      (
+        phi +
+          y
+      ) /
+
+      (
+        phi +
+          mu
+      )
+
+
+    w2 <-
+
+      digamma(
+        phi +
+          y
+      ) -
+
+      log(
+        phi +
+          mu
+      )
+
+
+    # ========================================================
+    # M STEP - BETA + PSI
+    # ========================================================
+
+    objetivo_media <- function(
+        par
+    ) {
+
+
+      beta_novo <-
+
+        par[
+          1:p
+        ]
+
+
+      gamma_novo <-
+
+        par[
+          (p + 1):
+            length(
+              par
+            )
+        ]
+
+
+      mu_novo <-
+
+        calcular_mu_spnb(
+
+          beta =
+            beta_novo,
+
+          gamma_psi =
+            gamma_novo,
+
+          X =
+            X,
+
+          E =
+            E,
+
+          S =
+            S,
+
+          grid_idx =
+            grid_idx
+
+        )
+
+
+      Q <-
+
+        sum(
+
+          y *
+            log(
+              mu_novo
+            ) -
+
+            w1 *
+            mu_novo
+
+        )
+
+
+      -Q
+
+    }
+
+
+    par_atual <-
+
+      c(
+        beta,
+        gamma_psi
+      )
+
+
+    lower <-
+
+      c(
+
+        rep(
+          -20,
+          p
+        ),
+
+        rep(
+          log(1e-10),
+          n_grids
+        )
+
+      )
+
+
+    upper <-
+
+      c(
+
+        rep(
+          20,
+          p
+        ),
+
+        rep(
+          log(1),
+          n_grids
+        )
+
+      )
+
+
+    opt_media <-
+
+      optim(
+
+        par =
+          par_atual,
+
+        fn =
+          objetivo_media,
+
+        method =
+          "L-BFGS-B",
+
+        lower =
+          lower,
+
+        upper =
+          upper,
+
+        control =
+          list(
+            maxit = 300
+          )
+
+      )
+
+
+    beta <-
+
+      opt_media$par[
+        1:p
+      ]
+
+
+    gamma_psi <-
+
+      opt_media$par[
+        (p + 1):
+          length(
+            opt_media$par
+          )
+      ]
+
+
+    # ========================================================
+    # M STEP - PHI
+    # ========================================================
+
+    objetivo_phi <- function(
+        log_phi
+    ) {
+
+
+      phi_novo <-
+
+        exp(
+          log_phi
+        )
+
+
+      Q_phi <-
+
+        length(y) *
+
+        (
+          phi_novo *
+            log(
+              phi_novo
+            ) -
+
+            lgamma(
+              phi_novo
+            )
+        ) +
+
+        (
+          phi_novo -
+            1
+        ) *
+        sum(
+          w2
+        ) -
+
+        phi_novo *
+        sum(
+          w1
+        )
+
+
+      -Q_phi
+
+    }
+
+
+    opt_phi <-
+
+      optimize(
+
+        objetivo_phi,
+
+        interval =
+          c(
+            log(1e-4),
+            log(1e5)
+          )
+
+      )
+
+
+    phi <-
+
+      exp(
+        opt_phi$minimum
+      )
+
+
+    # ========================================================
+    # LIKELIHOOD
+    # ========================================================
+
+    mu <-
+
+      calcular_mu_spnb(
+
+        beta =
+          beta,
+
+        gamma_psi =
+          gamma_psi,
+
+        X =
+          X,
+
+        E =
+          E,
+
+        S =
+          S,
+
+        grid_idx =
+          grid_idx
+
+      )
+
+
+    ll <-
+
+      loglik_nb(
+
+        y =
+          y,
+
+        mu =
+          mu,
+
+        phi =
+          phi
+
+      )
+
+
+    delta_ll <-
+
+      abs(
+        ll -
+          ll_anterior
+      )
+
+
+    historico <-
+
+      dplyr::bind_rows(
+
+        historico,
+
+        tibble::tibble(
+
+          iteracao =
+            iter,
+
+          logLik =
+            ll,
+
+          delta_logLik =
+            delta_ll,
+
+          phi =
+            phi
+
+        )
+
+      )
+
+
+    if (
+
+      iter >
+        1 &&
+
+      delta_ll <
+        tol
+
+    ) {
+
+
+      convergiu <-
+        TRUE
+
+      break
+
+    }
+
+
+    ll_anterior <-
+      ll
+
+  }
+
+
+  list(
+
+    beta =
+      beta,
+
+    gamma_psi =
+      gamma_psi,
+
+    psi =
+      exp(
+        gamma_psi
+      ),
+
+    phi =
+      phi,
+
+    mu =
+      mu,
+
+    logLik =
+      ll,
+
+    historico =
+      historico,
+
+    iteracoes =
+      iter,
+
+    convergiu =
+      convergiu
+
+  )
+
+}
+```
+
+# 11. Estimação do SP-NB Queen
+
+```{r spnb-fit, include=FALSE}
+
+# ============================================================
+# 11. ESTIMAR SP-NB
+# ============================================================
+
+coef_nb <-
+  coef(
+    fit_nb
+  )
+
+
+beta_init <-
+
+  c(
+
+    coef_nb[
+      "(Intercept)"
+    ],
+
+    coef_nb[
+      "z_prec_mensal"
+    ],
+
+    coef_nb[
+      "z_prec_max"
+    ],
+
+    coef_nb[
+      "z_dias_extremos"
+    ],
+
+    coef_nb[
+      "z_prec_lag1"
+    ],
+
+    coef_nb[
+      "z_pct_pisos_2"
+    ],
+
+    coef_nb[
+      "z_pct_pisos_3mais"
+    ],
+
+    coef_nb[
+      "z_pct_qualidade_media"
+    ],
+
+    coef_nb[
+      "z_pct_qualidade_baixa"
+    ],
+
+    coef_nb[
+      "z_pct_idade_11_20"
+    ],
+
+    coef_nb[
+      "z_pct_idade_21_30"
+    ],
+
+    coef_nb[
+      "z_pct_idade_30mais"
+    ]
+
+  )
+
+
+beta_init <-
+  as.numeric(
+    beta_init
+  )
+
+
+phi_init <-
+  fit_nb$theta
+
+
+fit_spnb <- fit_spnb_em(
+
+  y =
+    Y_train,
+
+  X =
+    X_train,
+
+  E =
+    E_train,
+
+  S =
+    S_train,
+
+  grid_idx =
+    grid_idx_train,
+
+  n_grids =
+    G,
+
+  beta_init =
+    beta_init,
+
+  phi_init =
+    phi_init,
+
+  max_iter =
+    MAX_ITER_EM,
+
+  tol =
+    TOL_EM
+
+)
+
+
+pred_sp_train <-
+
+  calcular_mu_spnb(
+
+    beta =
+      fit_spnb$beta,
+
+    gamma_psi =
+      fit_spnb$gamma_psi,
+
+    X =
+      X_train,
+
+    E =
+      E_train,
+
+    S =
+      S_train,
+
+    grid_idx =
+      grid_idx_train
+
+  )
+
+
+pred_sp_test <-
+
+  calcular_mu_spnb(
+
+    beta =
+      fit_spnb$beta,
+
+    gamma_psi =
+      fit_spnb$gamma_psi,
+
+    X =
+      X_test,
+
+    E =
+      E_test,
+
+    S =
+      S_test,
+
+    grid_idx =
+      grid_idx_test
+
+  )
+```
+
+# 12. Métricas preditivas
+
+```{r metricas-funcao, include=FALSE}
+
+# ============================================================
+# 12. METRICAS
+# ============================================================
+
+calcular_metricas <- function(
+    observado,
+    previsto,
+    nome
+) {
+
+
+  erro <-
+    observado -
+    previsto
+
+
+  ss_res <-
+
+    sum(
+      erro^2
+    )
+
+
+  ss_tot <-
+
+    sum(
+
+      (
+        observado -
+          mean(
+            observado
+          )
+      )^2
+
+    )
+
+
+  r2 <-
+
+    ifelse(
+
+      ss_tot >
+        0,
+
+      1 -
+        ss_res /
+        ss_tot,
+
+      NA_real_
+
+    )
+
+
+  correlacao <-
+
+    ifelse(
+
+      sd(
+        observado
+      ) >
+        0 &&
+
+      sd(
+        previsto
+      ) >
+        0,
+
+      cor(
+        observado,
+        previsto
+      ),
+
+      NA_real_
+
+    )
+
+
+  tibble::tibble(
+
+    Modelo =
+      nome,
+
+    Observado =
+      sum(
+        observado
+      ),
+
+    Previsto =
+      sum(
+        previsto
+      ),
+
+    Balance =
+      sum(
+        previsto
+      ) /
+      sum(
+        observado
+      ),
+
+    MAE =
+      mean(
+        abs(
+          erro
+        )
+      ),
+
+    RMSE =
+      sqrt(
+        mean(
+          erro^2
+        )
+      ),
+
+    R2 =
+      r2,
+
+    Correlacao =
+      correlacao
+
+  )
+
+}
+```
+
+```{r metricas-gerais}
+
+# ============================================================
+# 13. METRICAS TESTE
+# ============================================================
+
+metricas_teste <- dplyr::bind_rows(
+
+  calcular_metricas(
+
+    observado =
+      teste$sinistros,
+
+    previsto =
+      pred_nb_test,
+
+    nome =
+      "Negative Binomial"
+
+  ),
+
+
+  calcular_metricas(
+
+    observado =
+      teste$sinistros,
+
+    previsto =
+      pred_rf_test,
+
+    nome =
+      "Random Forest"
+
+  ),
+
+
+  calcular_metricas(
+
+    observado =
+      teste_sp$sinistros,
+
+    previsto =
+      pred_sp_test,
+
+    nome =
+      "SP-NB Queen"
+
+  )
+
+)
+
+
+knitr::kable(
+
+  metricas_teste,
+
+  digits = 4,
+
+  caption =
+    "Desempenho preditivo no período de teste"
+
+)
+```
+
+# 13. Melhora relativa versus Negative Binomial
+
+```{r melhora}
+
+rmse_nb <-
+
+  metricas_teste$RMSE[
+    metricas_teste$Modelo ==
+      "Negative Binomial"
+  ]
+
+
+mae_nb <-
+
+  metricas_teste$MAE[
+    metricas_teste$Modelo ==
+      "Negative Binomial"
+  ]
+
+
+melhora <- metricas_teste %>%
+
+  dplyr::mutate(
+
+    Melhora_RMSE_vs_NB =
+
+      100 *
+
+      (
+        rmse_nb -
+          RMSE
+      ) /
+
+      rmse_nb,
+
+
+    Melhora_MAE_vs_NB =
+
+      100 *
+
+      (
+        mae_nb -
+          MAE
+      ) /
+
+      mae_nb
+
+  ) %>%
+
+  dplyr::select(
+
+    Modelo,
+
+    RMSE,
+
+    Melhora_RMSE_vs_NB,
+
+    MAE,
+
+    Melhora_MAE_vs_NB
+
+  )
+
+
+knitr::kable(
+
+  melhora,
+
+  digits = 2,
+
+  caption =
+    "Melhora preditiva em relação à Negative Binomial"
+
+)
+```
+
+# 14. Sinistros observados e previstos por grid
+
+```{r pred-grade, include=FALSE}
+
+# ============================================================
+# 14. RESULTADOS POR GRID
+# ============================================================
+
+teste_resultados <- teste %>%
+
+  dplyr::mutate(
+
+    pred_nb =
+      pred_nb_test,
+
+    pred_rf =
+      pred_rf_test,
+
+    pred_sp =
+      pred_sp_test
+
+  )
+
+
+por_grade <- teste_resultados %>%
+
+  dplyr::group_by(
+
+    id_celula,
+    linha,
+    coluna
+
+  ) %>%
+
+  dplyr::summarise(
+
+    Observado =
+      sum(
+        sinistros
+      ),
+
+    NB =
+      sum(
+        pred_nb
+      ),
+
+    RF =
+      sum(
+        pred_rf
+      ),
+
+    SP_NB =
+      sum(
+        pred_sp
+      ),
+
+    .groups =
+      "drop"
+
+  )
+```
+
+```{r tabela-grade}
+
+knitr::kable(
+
+  por_grade,
+
+  digits = 2,
+
+  caption =
+    "Sinistros observados e previstos por grid"
+
+)
+```
+
+# 15. Acurácia percentual por grid
+
+A acurácia espacial é definida como:
+
+\[
+Accuracy_g
+=
+100
+\left(
+1-
+\frac{
+|Y_g-\hat Y_g|
+}{
+Y_g
+}
+\right).
+\]
+
+Valores negativos são truncados em zero.
+
+Assim:
+
+- **100%** = previsão agregada exatamente igual ao observado;
+- **90%** = erro absoluto equivalente a 10% do observado;
+- **50%** = erro equivalente a 50% do observado;
+- **0%** = erro igual ou superior ao observado.
+
+```{r accuracy-grade, include=FALSE}
+
+# ============================================================
+# 15. ACCURACY
+# ============================================================
+
+calcular_accuracy <- function(
+    observado,
+    previsto
+) {
+
+
+  accuracy <-
+
+    ifelse(
+
+      observado >
+        0,
+
+      100 *
+
+        (
+          1 -
+
+          abs(
+            observado -
+              previsto
+          ) /
+
+          observado
+
+        ),
+
+      ifelse(
+
+        previsto <
+          0.5,
+
+        100,
+
+        0
+
+      )
+
+    )
+
+
+  pmin(
+
+    100,
+
+    pmax(
+      accuracy,
+      0
+    )
+
+  )
+
+}
+
+
+por_grade <- por_grade %>%
+
+  dplyr::mutate(
+
+    Accuracy_NB =
+
+      calcular_accuracy(
+
+        Observado,
+
+        NB
+
+      ),
+
+
+    Accuracy_RF =
+
+      calcular_accuracy(
+
+        Observado,
+
+        RF
+
+      ),
+
+
+    Accuracy_SP =
+
+      calcular_accuracy(
+
+        Observado,
+
+        SP_NB
+
+      )
+
+  )
+```
+
+```{r tabela-accuracy}
+
+knitr::kable(
+
+  por_grade %>%
+
+    dplyr::select(
+
+      id_celula,
+
+      Observado,
+
+      Accuracy_NB,
+
+      Accuracy_RF,
+
+      Accuracy_SP
+
+    ),
+
+  digits = 1,
+
+  caption =
+    "Acurácia percentual por grid"
+
+)
+```
+
+# 16. Grid 5x5 — Negative Binomial
+
+```{r heatmap-nb}
+
+ggplot(
+
+  por_grade,
+
+  aes(
+
+    x =
+      coluna,
+
+    y =
+      linha,
+
+    fill =
+      Accuracy_NB
+
+  )
+
+) +
+
+  geom_tile(
+
+    color =
+      "white",
+
+    linewidth =
+      1
+
+  ) +
+
+  geom_text(
+
+    aes(
+
+      label =
+        paste0(
+
+          round(
+            Accuracy_NB
+          ),
+
+          "%"
+
+        )
+
+    ),
+
+    size =
+      4
+
+  ) +
+
+  scale_fill_gradientn(
+
+    colours =
+      c(
+        "#B2182B",
+        "#EF8A62",
+        "#FEE08B",
+        "#A6D96A",
+        "#1A9850"
+      ),
+
+    limits =
+      c(
+        0,
+        100
+      )
+
+  ) +
+
+  coord_equal() +
+
+  scale_y_reverse() +
+
+  labs(
+
+    title =
+      "Negative Binomial — acurácia por grid",
+
+    subtitle =
+      "Quanto mais verde, maior a proximidade entre observado e previsto",
+
+    x =
+      "Coluna",
+
+    y =
+      "Linha",
+
+    fill =
+      "Acurácia"
+
+  ) +
+
+  theme_minimal()
+```
+
+# 17. Grid 5x5 — Random Forest
+
+```{r heatmap-rf}
+
+ggplot(
+
+  por_grade,
+
+  aes(
+
+    x =
+      coluna,
+
+    y =
+      linha,
+
+    fill =
+      Accuracy_RF
+
+  )
+
+) +
+
+  geom_tile(
+
+    color =
+      "white",
+
+    linewidth =
+      1
+
+  ) +
+
+  geom_text(
+
+    aes(
+
+      label =
+        paste0(
+
+          round(
+            Accuracy_RF
+          ),
+
+          "%"
+
+        )
+
+    ),
+
+    size =
+      4
+
+  ) +
+
+  scale_fill_gradientn(
+
+    colours =
+      c(
+        "#B2182B",
+        "#EF8A62",
+        "#FEE08B",
+        "#A6D96A",
+        "#1A9850"
+      ),
+
+    limits =
+      c(
+        0,
+        100
+      )
+
+  ) +
+
+  coord_equal() +
+
+  scale_y_reverse() +
+
+  labs(
+
+    title =
+      "Random Forest — acurácia por grid",
+
+    subtitle =
+      "Quanto mais verde, maior a proximidade entre observado e previsto",
+
+    x =
+      "Coluna",
+
+    y =
+      "Linha",
+
+    fill =
+      "Acurácia"
+
+  ) +
+
+  theme_minimal()
+```
+
+# 18. Grid 5x5 — SP-NB Queen
+
+```{r heatmap-sp}
+
+ggplot(
+
+  por_grade,
+
+  aes(
+
+    x =
+      coluna,
+
+    y =
+      linha,
+
+    fill =
+      Accuracy_SP
+
+  )
+
+) +
+
+  geom_tile(
+
+    color =
+      "white",
+
+    linewidth =
+      1
+
+  ) +
+
+  geom_text(
+
+    aes(
+
+      label =
+        paste0(
+
+          round(
+            Accuracy_SP
+          ),
+
+          "%"
+
+        )
+
+    ),
+
+    size =
+      4
+
+  ) +
+
+  scale_fill_gradientn(
+
+    colours =
+      c(
+        "#B2182B",
+        "#EF8A62",
+        "#FEE08B",
+        "#A6D96A",
+        "#1A9850"
+      ),
+
+    limits =
+      c(
+        0,
+        100
+      )
+
+  ) +
+
+  coord_equal() +
+
+  scale_y_reverse() +
+
+  labs(
+
+    title =
+      "SP-NB Queen — acurácia por grid",
+
+    subtitle =
+      "Quanto mais verde, maior a proximidade entre observado e previsto",
+
+    x =
+      "Coluna",
+
+    y =
+      "Linha",
+
+    fill =
+      "Acurácia"
+
+  ) +
+
+  theme_minimal()
+```
+
+# 19. Acurácia espacial média
+
+```{r media-accuracy}
+
+accuracy_media <- tibble::tibble(
+
+  Modelo =
+    c(
+      "Negative Binomial",
+      "Random Forest",
+      "SP-NB Queen"
+    ),
+
+  Accuracy_media =
+    c(
+
+      mean(
+        por_grade$Accuracy_NB
+      ),
+
+      mean(
+        por_grade$Accuracy_RF
+      ),
+
+      mean(
+        por_grade$Accuracy_SP
+      )
+
+    ),
+
+  Accuracy_mediana =
+    c(
+
+      median(
+        por_grade$Accuracy_NB
+      ),
+
+      median(
+        por_grade$Accuracy_RF
+      ),
+
+      median(
+        por_grade$Accuracy_SP
+      )
+
+    ),
+
+  Grids_acima_90pct =
+    c(
+
+      sum(
+        por_grade$Accuracy_NB >=
+          90
+      ),
+
+      sum(
+        por_grade$Accuracy_RF >=
+          90
+      ),
+
+      sum(
+        por_grade$Accuracy_SP >=
+          90
+      )
+
+    )
+
+)
+
+
+knitr::kable(
+
+  accuracy_media,
+
+  digits = 1,
+
+  caption =
+    "Desempenho espacial entre os 25 grids"
+
+)
+```
+
+# 20. Observado versus previsto por grid
+
+```{r scatter-grade}
+
+scatter_data <- por_grade %>%
+
+  dplyr::select(
+
+    id_celula,
+
+    Observado,
+
+    NB,
+
+    RF,
+
+    SP_NB
+
+  ) %>%
+
+  tidyr::pivot_longer(
+
+    cols =
+      c(
+        NB,
+        RF,
+        SP_NB
+      ),
+
+    names_to =
+      "Modelo",
+
+    values_to =
+      "Previsto"
+
+  ) %>%
+
+  dplyr::mutate(
+
+    Modelo =
+      dplyr::recode(
+
+        Modelo,
+
+        NB =
+          "Negative Binomial",
+
+        RF =
+          "Random Forest",
+
+        SP_NB =
+          "SP-NB Queen"
+
+      )
+
+  )
+
+
+limite_scatter <-
+
+  max(
+
+    c(
+      scatter_data$Observado,
+      scatter_data$Previsto
+    ),
+
+    na.rm =
+      TRUE
+
+  )
+
+
+ggplot(
+
+  scatter_data,
+
+  aes(
+
+    x =
+      Observado,
+
+    y =
+      Previsto
+
+  )
+
+) +
+
+  geom_point(
+    size = 2.5
+  ) +
+
+  geom_abline(
+
+    slope =
+      1,
+
+    intercept =
+      0,
+
+    linetype =
+      "dashed"
+
+  ) +
+
+  facet_wrap(
+    ~ Modelo
+  ) +
+
+  coord_cartesian(
+
+    xlim =
+      c(
+        0,
+        limite_scatter
+      ),
+
+    ylim =
+      c(
+        0,
+        limite_scatter
+      )
+
+  ) +
+
+  labs(
+
+    title =
+      "Sinistros observados versus previstos por grid",
+
+    subtitle =
+      "Quanto mais próximos da diagonal, melhor a aderência espacial",
+
+    x =
+      "Observado",
+
+    y =
+      "Previsto"
+
+  ) +
+
+  theme_minimal()
+```
+
+# 21. Métricas no nível do grid
+
+```{r metricas-grid}
+
+calcular_metricas_grid <- function(
+    observado,
+    previsto,
+    nome
+) {
+
+
+  tibble::tibble(
+
+    Modelo =
+      nome,
+
+    MAE_Grid =
+      mean(
+
+        abs(
+          observado -
+            previsto
+        )
+
+      ),
+
+    RMSE_Grid =
+      sqrt(
+
+        mean(
+
+          (
+            observado -
+              previsto
+          )^2
+
+        )
+
+      ),
+
+    Correlacao_Grid =
+
+      cor(
+        observado,
+        previsto
+      )
+
+  )
+
+}
+
+
+metricas_grid <- dplyr::bind_rows(
+
+  calcular_metricas_grid(
+
+    por_grade$Observado,
+
+    por_grade$NB,
+
+    "Negative Binomial"
+
+  ),
+
+
+  calcular_metricas_grid(
+
+    por_grade$Observado,
+
+    por_grade$RF,
+
+    "Random Forest"
+
+  ),
+
+
+  calcular_metricas_grid(
+
+    por_grade$Observado,
+
+    por_grade$SP_NB,
+
+    "SP-NB Queen"
+
+  )
+
+)
+
+
+knitr::kable(
+
+  metricas_grid,
+
+  digits = 4,
+
+  caption =
+    "Desempenho agregado no nível dos grids"
+
+)
+```
+
+# 22. Comparação temporal
+
+```{r ano}
+
+por_ano <- teste_resultados %>%
+
+  dplyr::group_by(
+    ano
+  ) %>%
+
+  dplyr::summarise(
+
+    Observado =
+      sum(
+        sinistros
+      ),
+
+    NB =
+      sum(
+        pred_nb
+      ),
+
+    RF =
+      sum(
+        pred_rf
+      ),
+
+    SP_NB =
+      sum(
+        pred_sp
+      ),
+
+    .groups =
+      "drop"
+
+  ) %>%
+
+  tidyr::pivot_longer(
+
+    cols =
+      c(
+        Observado,
+        NB,
+        RF,
+        SP_NB
+      ),
+
+    names_to =
+      "Modelo",
+
+    values_to =
+      "Sinistros"
+
+  ) %>%
+
+  dplyr::mutate(
+
+    Modelo =
+      dplyr::recode(
+
+        Modelo,
+
+        Observado =
+          "Observado",
+
+        NB =
+          "Negative Binomial",
+
+        RF =
+          "Random Forest",
+
+        SP_NB =
+          "SP-NB Queen"
+
+      )
+
+  )
+
+
+ggplot(
+
+  por_ano,
+
+  aes(
+
+    x =
+      ano,
+
+    y =
+      Sinistros,
+
+    linetype =
+      Modelo,
+
+    shape =
+      Modelo
+
+  )
+
+) +
+
+  geom_line(
+    linewidth = 0.8
+  ) +
+
+  geom_point(
+    size = 2
+  ) +
+
+  labs(
+
+    title =
+      "Sinistros observados e previstos por ano",
+
+    x =
+      "Ano",
+
+    y =
+      "Número de sinistros",
+
+    linetype =
+      NULL,
+
+    shape =
+      NULL
+
+  ) +
+
+  theme_minimal()
+```
+
+# 23. Importância das variáveis — Random Forest
+
+```{r rf-importance}
+
+importance_rf <-
+
+  as.data.frame(
+
+    randomForest::importance(
+      fit_rf
+    )
+
+  )
+
+
+importance_rf$Variavel <-
+  rownames(
+    importance_rf
+  )
+
+
+# Para regressao, IncNodePurity costuma estar disponivel.
+# Quando %IncMSE estiver disponivel, usamos essa medida.
+
+if (
+  "%IncMSE" %in%
+    names(
+      importance_rf
+    )
+) {
+
+
+  importance_plot <- importance_rf %>%
+
+    dplyr::arrange(
+      dplyr::desc(
+        `%IncMSE`
+      )
+    )
+
+
+  ggplot(
+
+    importance_plot,
+
+    aes(
+
+      x =
+        reorder(
+          Variavel,
+          `%IncMSE`
+        ),
+
+      y =
+        `%IncMSE`
+
+    )
+
+  ) +
+
+    geom_col() +
+
+    coord_flip() +
+
+    labs(
+
+      title =
+        "Importância das variáveis — Random Forest",
+
+      x =
+        NULL,
+
+      y =
+        "% aumento do MSE"
+
+    ) +
+
+    theme_minimal()
+
+
+} else {
+
+
+  importance_plot <- importance_rf %>%
+
+    dplyr::arrange(
+      dplyr::desc(
+        IncNodePurity
+      )
+    )
+
+
+  ggplot(
+
+    importance_plot,
+
+    aes(
+
+      x =
+        reorder(
+          Variavel,
+          IncNodePurity
+        ),
+
+      y =
+        IncNodePurity
+
+    )
+
+  ) +
+
+    geom_col() +
+
+    coord_flip() +
+
+    labs(
+
+      title =
+        "Importância das variáveis — Random Forest",
+
+      x =
+        NULL,
+
+      y =
+        "Node purity"
+
+    ) +
+
+    theme_minimal()
+
+}
+```
+
+# 24. Coeficientes da Negative Binomial e SP-NB
+
+```{r coeficientes}
+
+tabela_coeficientes <- tibble::tibble(
+
+  Variavel =
+    colnames(
+      X_train
+    ),
+
+  Negative_Binomial =
+    as.numeric(
+      coef(
+        fit_nb
+      )
+    ),
+
+  SP_NB_Queen =
+    fit_spnb$beta
+
+)
+
+
+knitr::kable(
+
+  tabela_coeficientes,
+
+  digits = 5,
+
+  caption =
+    "Coeficientes dos modelos paramétricos"
+
+)
+```
+
+# 25. Efeito espacial estimado por grid
+
+```{r psi-grid}
+
+tabela_psi <- tibble::tibble(
+
+  id_celula =
+    grid_order,
+
+  psi_estimado =
+    fit_spnb$psi,
+
+  vizinhos_queen =
+    rowSums(
+      A_queen
+    )
+
+)
+
+
+if (
+  file.exists(
+    "parametros_psi_true_v4.csv"
+  )
+) {
+
+
+  psi_true <- readr::read_csv(
+
+    "parametros_psi_true_v4.csv",
+
+    show_col_types =
+      FALSE
+
+  )
+
+
+  tabela_psi <- tabela_psi %>%
+
+    dplyr::left_join(
+
+      psi_true,
+
+      by =
+        "id_celula"
+
+    )
+
+}
+
+
+knitr::kable(
+
+  tabela_psi,
+
+  digits = 7,
+
+  caption =
+    "Efeito espaço-temporal estimado por grid"
+
+)
+```
+
+# 26. Recuperação do efeito espacial
+
+```{r psi-diagnostico}
+
+if (
+  "psi_true" %in%
+    names(
+      tabela_psi
+    )
+) {
+
+
+  diagnostico_psi <- tibble::tibble(
+
+    Indicador =
+      c(
+        "Correlação psi verdadeiro vs estimado",
+        "MAE do psi"
+      ),
+
+    Valor =
+      c(
+
+        cor(
+
+          tabela_psi$psi_true,
+
+          tabela_psi$psi_estimado
+
+        ),
+
+        mean(
+
+          abs(
+
+            tabela_psi$psi_true -
+              tabela_psi$psi_estimado
+
+          )
+
+        )
+
+      )
+
+  )
+
+
+  knitr::kable(
+
+    diagnostico_psi,
+
+    digits = 6,
+
+    caption =
+      "Recuperação do efeito espacial verdadeiro"
+
+  )
+
+}
+```
+
+# 27. Convergência do SP-NB Queen
+
+```{r convergencia}
+
+ggplot(
+
+  fit_spnb$historico,
+
+  aes(
+
+    x =
+      iteracao,
+
+    y =
+      logLik
+
+  )
+
+) +
+
+  geom_line(
+    linewidth = 0.9
+  ) +
+
+  labs(
+
+    title =
+      "Convergência do algoritmo EM — SP-NB Queen",
+
+    subtitle =
+      paste(
+        "Iterações:",
+        fit_spnb$iteracoes,
+        "| Convergiu:",
+        fit_spnb$convergiu
+      ),
+
+    x =
+      "Iteração",
+
+    y =
+      "Log-likelihood"
+
+  ) +
+
+  theme_minimal()
+```
+
+# 28. Resultado consolidado
+
+```{r resumo-final}
+
+melhor_rmse <-
+
+  metricas_teste %>%
+
+  dplyr::slice_min(
+
+    RMSE,
+
+    n =
+      1,
+
+    with_ties =
+      FALSE
+
+  ) %>%
+
+  dplyr::pull(
+    Modelo
+  )
+
+
+melhor_mae <-
+
+  metricas_teste %>%
+
+  dplyr::slice_min(
+
+    MAE,
+
+    n =
+      1,
+
+    with_ties =
+      FALSE
+
+  ) %>%
+
+  dplyr::pull(
+    Modelo
+  )
+
+
+melhor_r2 <-
+
+  metricas_teste %>%
+
+  dplyr::filter(
+    !is.na(
+      R2
+    )
+  ) %>%
+
+  dplyr::slice_max(
+
+    R2,
+
+    n =
+      1,
+
+    with_ties =
+      FALSE
+
+  ) %>%
+
+  dplyr::pull(
+    Modelo
+  )
+
+
+melhor_accuracy <-
+
+  accuracy_media %>%
+
+  dplyr::slice_max(
+
+    Accuracy_media,
+
+    n =
+      1,
+
+    with_ties =
+      FALSE
+
+  ) %>%
+
+  dplyr::pull(
+    Modelo
+  )
+
+
+melhor_rmse_grid <-
+
+  metricas_grid %>%
+
+  dplyr::slice_min(
+
+    RMSE_Grid,
+
+    n =
+      1,
+
+    with_ties =
+      FALSE
+
+  ) %>%
+
+  dplyr::pull(
+    Modelo
+  )
+
+
+resumo_final <- tibble::tibble(
+
+  Indicador =
+    c(
+      "Menor RMSE mensal",
+      "Menor MAE mensal",
+      "Maior R²",
+      "Maior acurácia média por grid",
+      "Menor RMSE agregado por grid"
+    ),
+
+  Melhor_modelo =
+    c(
+      melhor_rmse,
+      melhor_mae,
+      melhor_r2,
+      melhor_accuracy,
+      melhor_rmse_grid
+    )
+
+)
+
+
+knitr::kable(
+
+  resumo_final,
+
+  caption =
+    "Resumo dos melhores modelos por critério"
+
+)
+```
+
+# 29. Interpretação dos resultados
+
+A comparação entre os três modelos deve considerar diferentes dimensões.
+
+**Negative Binomial** funciona como benchmark estatístico paramétrico. O modelo pressupõe uma estrutura funcional explícita entre as covariáveis e a frequência de sinistros.
+
+**Random Forest** permite relações não lineares e interações entre as variáveis sem impor previamente uma forma funcional.
+
+**SP-NB Queen** mantém a estrutura probabilística da Negative Binomial e adiciona explicitamente a informação de ocorrência anormal de sinistros nos grids vizinhos no período anterior.
+
+As métricas mensais avaliam a qualidade da previsão em cada observação grid-mês.
+
+Os grids 5x5 avaliam uma dimensão diferente: se o modelo consegue distribuir corretamente o volume acumulado de sinistros entre as diferentes regiões.
+
+Um modelo pode, portanto, apresentar bom resultado global e ainda possuir erros localizados espacialmente. Por isso, o diagnóstico deve considerar conjuntamente:
+
+- MAE;
+- RMSE;
+- \(R^2\);
+- correlação;
+- balance;
+- acurácia por grid;
+- RMSE por grid;
+- evolução temporal.
+
+# 30. Exportação dos resultados
+
+```{r exportacao, include=FALSE}
+
+# ============================================================
+# 30. EXPORTACAO
+# ============================================================
+
+dir.create(
+
+  "resultados_nb_rf_spnb",
+
+  showWarnings =
+    FALSE
+
+)
+
+
+readr::write_csv(
+
+  metricas_teste,
+
+  "resultados_nb_rf_spnb/metricas_teste.csv"
+
+)
+
+
+readr::write_csv(
+
+  melhora,
+
+  "resultados_nb_rf_spnb/melhora_vs_nb.csv"
+
+)
+
+
+readr::write_csv(
+
+  por_grade,
+
+  "resultados_nb_rf_spnb/resultados_por_grid.csv"
+
+)
+
+
+readr::write_csv(
+
+  accuracy_media,
+
+  "resultados_nb_rf_spnb/acuracia_media_grid.csv"
+
+)
+
+
+readr::write_csv(
+
+  metricas_grid,
+
+  "resultados_nb_rf_spnb/metricas_grid.csv"
+
+)
+
+
+readr::write_csv(
+
+  por_ano,
+
+  "resultados_nb_rf_spnb/resultados_por_ano.csv"
+
+)
+
+
+readr::write_csv(
+
+  tabela_coeficientes,
+
+  "resultados_nb_rf_spnb/coeficientes_modelos_parametricos.csv"
+
+)
+
+
+readr::write_csv(
+
+  tabela_psi,
+
+  "resultados_nb_rf_spnb/psi_por_grid.csv"
+
+)
+```
