@@ -30,7 +30,6 @@ Códigos em R para montar o painel grid × mês, ajustar os três modelos (trein
 
 ### Bases externas
 - **CHIRPS** (Climate Hazards Group InfraRed Precipitation with Station data): precipitação mensal sobre a área de estudo.
-- [outras bases, se houver]
 
 ## Autores
 
